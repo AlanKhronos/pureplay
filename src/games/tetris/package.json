@@ -1,0 +1,5 @@
+{
+  "type": "module",
+  "private": true,
+  "description": "「纯净玩」俄罗斯方块模块 —— 此文件只为了让 Node 以 ES Module 方式加载本目录的 .js（微信小游戏侧不读它），不影响任何共享文件。"
+}

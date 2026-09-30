@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>五子棋 · 预览</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #0c0e15;
+    display: grid; place-items: center;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    overflow: hidden;
+  }
+  /* 手机比例的内容框：桌面预览时也能看到竖屏效果 */
+  #stage {
+    position: relative;
+    width: min(100vw, 420px);
+    height: min(100vh, 900px);
+    background: #11141d;
+    border-radius: 0;
+    overflow: hidden;
+    box-shadow: 0 24px 60px rgba(0,0,0,.6);
+  }
+  canvas { display: block; width: 100%; height: 100%; touch-action: manipulation; }
+  #tip {
+    position: absolute; left: 0; right: 0; bottom: 6px;
+    text-align: center; font-size: 11px; color: rgba(242,243,247,.35);
+    pointer-events: none; user-select: none;
+  }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div id="tip">点击落子 · 支持鼠标与触屏（此页仅用于 UI 预览）</div>
+  </div>
+
+  <script type="module">
+    import { createGame } from '../src/app.js';
+    import { createBgm, createAudioContext } from '../src/audio/bgm.js';
+    import { createSfx } from '../src/audio/sfx.js';
+
+    const stage = document.getElementById('stage');
+    const canvas = document.getElementById('cv');
+    const ctx = canvas.getContext('2d');
+
+    // 浏览器里同样用 Web Audio 合成背景音乐（与小游戏同一份代码）
+    const audioCtx = createAudioContext();
+    const bgm = createBgm({ context: audioCtx, volume: 0.5 });
+    const sfx = createSfx({ context: audioCtx, volume: 0.6 });
+
+    let game;
+
+    // 允许用 URL 参数模拟实机安全区，便于在电脑上验证"底部按钮是否被系统栏遮挡"
+    // 例：?inset=34  模拟底部手势条 34px；?status=44 模拟顶部状态栏
+    function insetsFromQuery() {
+      const q = new URLSearchParams(location.search);
+      return {
+        top: Number(q.get('status') ?? 0) || 0,
+        bottom: Number(q.get('inset') ?? 0) || 0,
+      };
+    }
+
+    function fit() {
+      const rect = stage.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.__dpr = dpr;
+      canvas.width = Math.floor(rect.width * dpr);
+      canvas.height = Math.floor(rect.height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const insets = insetsFromQuery();
+      if (!game) {
+        game = createGame({
+          width: rect.width, height: rect.height, insets,
+          mode: 'casual', level: 2, humanColor: 1,
+          bgm, sfx, settings: { music: 0.5 },
+        });
+      } else {
+        game.resize(rect.width, rect.height, insets);
+      }
+    }
+
+    fit();
+    window.addEventListener('resize', () => { fit(); });
+
+    // 统一的「按一下」：鼠标与触屏都归一到 tap
+    let down = null;
+    const slop = 12;
+    const slide = 28;   // 超过此距离视为滑动手势（2048 等）
+
+    function pos(e) {
+      const rect = canvas.getBoundingClientRect();
+      const src = e.changedTouches ? e.changedTouches[0] : e;
+      return { x: src.clientX - rect.left, y: src.clientY - rect.top };
+    }
+
+    canvas.addEventListener('pointerdown', (e) => {
+      const p = pos(e); down = p; game.press(p.x, p.y);
+    });
+    canvas.addEventListener('pointerup', (e) => {
+      const p = pos(e); game.release();
+      if (!down) return;
+      const d0 = down;
+      const moved = Math.hypot(p.x - d0.x, p.y - d0.y);
+      down = null;
+      if (moved >= slide) { game.gesture(d0.x, d0.y, p.x, p.y, Date.now()); return; }
+      if (moved > slop) return;
+      game.tap(p.x, p.y, Date.now());
+    });
+    canvas.addEventListener('pointermove', (e) => {
+      const p = pos(e);
+      game.hover(p.x, p.y);
+    });
+    canvas.addEventListener('pointerleave', () => { game.clearHover(); });
+    canvas.addEventListener('pointercancel', () => { game.release(); game.clearHover(); down = null; });
+
+    // 方便在浏览器控制台里调试/截图特定局面
+    window.__game = game;
+    window.__bgm = bgm;
+    window.__sfx = sfx;
+
+    function loop() {
+      const now = Date.now();
+      game.update(now);
+      game.render(ctx, now);
+      requestAnimationFrame(loop);
+    }
+    loop();
+  </script>
+</body>
+</html>

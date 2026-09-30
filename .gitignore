@@ -1,0 +1,16 @@
+# 依赖与构建产物
+node_modules/
+.npm-cache/
+
+# 会话/索引产物（可由工具重生成，不入库）
+.codesearch/
+_agent-inventory/
+
+# 系统与日志
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 微信开发者工具的本地私有配置（含本机路径，不适合公开）
+project.private.config.json

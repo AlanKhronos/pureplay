@@ -1,0 +1,2578 @@
+纯净玩棋类益智游戏合集软件 V1.0                                                                    第 1 / 49 页
+------------------------------------------------------------------------------------------------
+// ===== FILE: game.js =====
+/**
+ * 微信小游戏入口
+ *
+ * 关键约束（本平台没有 document / window）：
+ *   - 上屏画布只能用 wx.createCanvas()；
+ *   - 逻辑分辨率用 wx.getWindowInfo() 的逻辑像素，画布物理像素再乘 pixelRatio，
+ *     之后 ctx.setTransform(dpr,...)，后续绘制全部用逻辑像素；
+ *   - **必须把上下安全区让出来**：底部手势条 / 导航条会盖住按钮（实机踩过的坑），
+ *     顶部状态栏会盖住标题。这里算出 insets 交给布局层处理。
+ */
+import { createGame } from './src/app.js';
+import { createBgm, createAudioContext } from './src/audio/bgm.js';
+/** 收集屏幕信息，并换算安全区上下让位量。 */
+function screenInfo() {
+  const w = typeof wx.getWindowInfo === 'function'
+    ? wx.getWindowInfo()
+    : wx.getSystemInfoSync();
+  const windowWidth = w.windowWidth;
+  const windowHeight = w.windowHeight;
+  const screenHeight = w.screenHeight ?? windowHeight;
+  const statusBarHeight = w.statusBarHeight ?? 0;
+  const safe = w.safeArea;
+  // 底部被占用高度：屏底到安全区底边的距离（手势条 / 导航条）
+  let bottomInset = 0;
+  if (safe && typeof safe.bottom === 'number') {
+    bottomInset = Math.max(0, Math.round(screenHeight - safe.bottom));
+  }
+  // 顶部让位：只有当 windowHeight 没排除状态栏时才需要（多数机型已排除，这里保守取 0）
+  const topInset = 0;
+  return {
+    width: windowWidth,
+    height: windowHeight,
+    dpr: w.pixelRatio || 1,
+    insets: { top: topInset, bottom: bottomInset },
+    debug: { windowWidth, windowHeight, screenHeight, statusBarHeight, safeArea: safe ?? null },
+  };
+}
+const info = screenInfo();
+const canvas = wx.createCanvas();
+const ctx = canvas.getContext('2d');
+function applySize(width, height, dpr) {
+  canvas.width = Math.floor(width * dpr);
+  canvas.height = Math.floor(height * dpr);
+  if (typeof ctx.setTransform === 'function') ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  else ctx.scale(dpr, dpr);
+}
+applySize(info.width, info.height, info.dpr);
+/* ── 背景音乐（古筝风格，程序化合成；环境不支持则静默降级）── */
+const bgm = createBgm({ context: createAudioContext(), volume: 0.5 });
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                    第 2 / 49 页
+------------------------------------------------------------------------------------------------
+/* ── 游戏实例（从「纯净玩」大厅开始）── */
+const game = createGame({
+  width: info.width,
+  height: info.height,
+  insets: info.insets,
+  mode: 'casual',
+  level: 2,
+  humanColor: 1, // 黑先
+  bgm,
+  settings: { music: 0.5 },
+});
+/* ── 触摸：按下给反馈，抬起判落子；起止距离过大视为拖动 ── */
+let touchStart = null;
+const TAP_SLOP = 12;
+wx.onTouchStart((e) => {
+  const t = e.touches && e.touches[0];
+  if (!t) return;
+  touchStart = { x: t.clientX, y: t.clientY };
+  game.press(t.clientX, t.clientY);
+});
+wx.onTouchEnd((e) => {
+  const t = (e.changedTouches && e.changedTouches[0]) || (e.touches && e.touches[0]);
+  game.release();
+  if (!t || !touchStart) { touchStart = null; return; }
+  const moved = Math.hypot(t.clientX - touchStart.x, t.clientY - touchStart.y);
+  touchStart = null;
+  if (moved > TAP_SLOP) return;
+  game.tap(t.clientX, t.clientY, Date.now());
+});
+wx.onTouchCancel(() => { game.release(); touchStart = null; });
+/* ── 切后台时停音乐，回来再续（省电，也避免后台噪音）── */
+if (typeof wx.onHide === 'function') {
+  wx.onHide(() => { try { bgm.stop(); } catch { /* ignore */ } });
+}
+if (typeof wx.onShow === 'function') {
+  wx.onShow(() => {
+    try {
+      if (game.state.settings.music > 0) bgm.start();
+    } catch { /* ignore */ }
+  });
+}
+/* ── 渲染循环 ── */
+function loop() {
+  const now = Date.now();
+  game.update(now);
+  game.render(ctx, now);
+  requestAnimationFrame(loop);
+}
+loop();
+/* 便于在小游戏调试器里观察状态与排查安全区问题 */
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                    第 3 / 49 页
+------------------------------------------------------------------------------------------------
+if (typeof globalThis !== 'undefined') {
+  globalThis.__gomoku = game;
+  globalThis.__gomokuScreen = info;
+  globalThis.__gomokuBgm = bgm;
+}
+// ===== FILE: src/app.js =====
+/**
+ * 游戏装配层：场景状态机（大厅 → 模式 → 难度 → 对局）、输入分发、AI 调度、音频控制。
+ * 平台无关——小游戏入口与浏览器预览共用这份代码。
+ *
+ * 场景流转：
+ *   hall（纯净玩大厅：选游戏）
+ *     → mode（选规则：休闲 / 专业，上下并排）
+ *       → level（选难度 1..5）
+ *         → game（对局；可随时返回或认输回大厅）
+ *   任意场景右上角齿轮 → 设置面板（背景音乐音量）
+ */
+import { createBoard, place, undo, canPlace, EMPTY, BLACK, WHITE, BOARD_SIZE } from './core/board.js';
+import { chooseMove, LEVELS } from './core/ai.js';
+import { checkMove, RULE_CASUAL, RULE_PRO, RULE_LABELS } from './core/rules.js';
+import {
+  computeLayout, computeHallLayout, computeModeLayout, computeLevelLayout, computeSettingsLayout,
+  hitButton, hitGame, hitMode, hitLevel, hitBack, hitGear, hitRect, sliderValueAt,
+} from './ui/layout.js';
+import { THEME, MENU } from './ui/theme.js';
+import { renderFrame } from './ui/renderer.js';
+import { renderHall, renderMode, renderLevel, renderSettings, MODE_ORDER, LEVEL_ORDER, LEVEL_DESC } from './ui/screens.js';
+export const SCENE_HALL = 'hall';
+export const SCENE_MODE = 'mode';
+export const SCENE_LEVEL = 'level';
+export const SCENE_GAME = 'game';
+/**
+ * @param options.width/height 逻辑像素尺寸
+ * @param options.insets { top, bottom } 安全区（必须传，否则底部按钮被系统栏遮挡）
+ * @param options.mode/level 初始规则与难度
+ * @param options.bgm 背景音乐实例（可选；不传则静音运行）
+ * @param options.settings 初始设置（music 0..1）
+ */
+export function createGame(options = {}) {
+  const width = options.width ?? 375;
+  const height = options.height ?? 667;
+  const insets = options.insets ?? { top: 0, bottom: 0 };
+  const theme = options.theme ?? THEME;
+  const menuTheme = options.menuTheme ?? MENU;
+  const bgm = options.bgm ?? null;
+  const state = {
+    scene: SCENE_HALL,
+    // 选择项
+    mode: options.mode ?? RULE_CASUAL,
+    level: options.level ?? 2,
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                    第 4 / 49 页
+------------------------------------------------------------------------------------------------
+    // 通用按压反馈 { kind, index }
+    press: null,
+    // 设置
+    settings: { music: options.settings?.music ?? 0.5 },
+    settingsOpen: false,
+    settingsLayout: null,
+    // 对局
+    board: createBoard(),
+    humanColor: options.humanColor ?? BLACK,
+    aiThinking: false,
+    pressIndex: -1,
+    score: { win: 0, lose: 0, draw: 0 },
+    anim: { stones: new Map(), overT0: 0 },
+    hover: null,
+    toast: null,
+    buttonLabels: ['重新开始', '悔棋', '认输'],
+  };
+  // 布局
+  let gameLayout = computeLayout(width, height, insets);
+  let hallLayout = computeHallLayout(width, height, insets, 4);
+  let modeLayout = computeModeLayout(width, height, insets, MODE_ORDER.length);
+  let levelLayout = computeLevelLayout(width, height, insets, LEVEL_ORDER.length);
+  let settingsLayout = computeSettingsLayout(width, height, insets);
+  let pendingAiAt = 0;
+  let counted = false;
+  let audioPrimed = false;
+  /* ── 内部工具 ── */
+  const isHumanTurn = () => state.board.winner === EMPTY && state.board.current === state.humanColor;
+  function showToast(text, now, ms = 1600) {
+    state.toast = { text, t0: now ?? Date.now(), ms };
+  }
+  function markStoneAnim(x, y, now) {
+    state.anim.stones.set(`${x},${y}`, now);
+    if (state.anim.stones.size > 12) {
+      state.anim.stones.delete(state.anim.stones.keys().next().value);
+    }
+  }
+  function settleScore() {
+    if (counted) return;
+    counted = true;
+    const w = state.board.winner;
+    if (w === EMPTY) return;
+    if (w === state.humanColor) state.score.win++;
+    else if (w === -1) state.score.draw++;
+    else state.score.lose++;
+  }
+  function afterMove(now) {
+    if (state.board.winner !== EMPTY) {
+      state.aiThinking = false;
+      pendingAiAt = 0;
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                    第 5 / 49 页
+------------------------------------------------------------------------------------------------
+      state.anim.overT0 = now;
+      state.hover = null;
+      settleScore();
+      return;
+    }
+    if (state.board.current !== state.humanColor) {
+      state.aiThinking = true;
+      pendingAiAt = now + theme.aiThinkMinMs;
+    }
+  }
+  function resetBoard(now = 0) {
+    state.board = createBoard();
+    state.aiThinking = false;
+    state.pressIndex = -1;
+    state.anim.stones.clear();
+    state.anim.overT0 = 0;
+    state.hover = null;
+    state.toast = null;
+    pendingAiAt = 0;
+    counted = false;
+    if (state.humanColor === WHITE) {
+      state.aiThinking = true;
+      pendingAiAt = now + theme.aiThinkMinMs;
+    }
+  }
+  /** 首次交互时启动音频（多数平台要求用户手势后才能出声）。 */
+  function primeAudio() {
+    if (audioPrimed || !bgm) return;
+    audioPrimed = true;
+    try {
+      bgm.setVolume(state.settings.music);
+      if (state.settings.music > 0) bgm.start();
+    } catch { /* 音频不可用则静默 */ }
+  }
+  function applyMusicVolume(v) {
+    state.settings.music = Math.max(0, Math.min(1, v));
+    if (!bgm) return;
+    try {
+      bgm.setVolume(state.settings.music);
+      if (state.settings.music > 0 && !bgm.isPlaying()) bgm.start();
+      if (state.settings.music === 0) bgm.stop();
+    } catch { /* ignore */ }
+  }
+  /* ── 对外 API ── */
+  const api = {
+    get scene() { return state.scene; },
+    get state() { return state; },
+    get theme() { return theme; },
+    get menuTheme() { return menuTheme; },
+    /** 当前场景的布局（渲染与命中都用它）。 */
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                    第 6 / 49 页
+------------------------------------------------------------------------------------------------
+    get activeLayout() {
+      switch (state.scene) {
+        case SCENE_HALL: return hallLayout;
+        case SCENE_MODE: return modeLayout;
+        case SCENE_LEVEL: return levelLayout;
+        default: return gameLayout;
+      }
+    },
+    get layout() { return api.activeLayout; },
+    get boardLayout() { return gameLayout; },
+    get settingsLayoutRef() { return settingsLayout; },
+    resize(w, h, ins = insets) {
+      gameLayout = computeLayout(w, h, ins);
+      hallLayout = computeHallLayout(w, h, ins, 4);
+      modeLayout = computeModeLayout(w, h, ins, MODE_ORDER.length);
+      levelLayout = computeLevelLayout(w, h, ins, LEVEL_ORDER.length);
+      settingsLayout = computeSettingsLayout(w, h, ins);
+      state.settingsLayout = settingsLayout;
+    },
+    reset(now = 0) { resetBoard(now); },
+    back() { state.scene = SCENE_HALL; state.press = null; state.toast = null; pendingAiAt = 0; state.aiThinking = false; },
+    /** 认输：判负、记分，然后回大厅。 */
+    resign(now = 0) {
+      if (state.board.winner === EMPTY) {
+        state.board.winner = state.humanColor === BLACK ? WHITE : BLACK;
+        settleScore();
+      }
+      state.aiThinking = false;
+      pendingAiAt = 0;
+      showToast('已认输，返回大厅', now, 1200);
+      setTimeout(() => { state.scene = SCENE_HALL; state.toast = null; }, 700);
+      return { type: 'resign' };
+    },
+    undoMove() {
+      if (state.aiThinking) return { ok: false, reason: 'thinking' };
+      let done = 0;
+      for (let i = 0; i < 2; i++) {
+        const r = undo(state.board);
+        if (!r.ok) break;
+        state.anim.stones.delete(`${r.undone.x},${r.undone.y}`);
+        done++;
+      }
+      state.anim.overT0 = 0;
+      state.toast = null;
+      counted = false;
+      pendingAiAt = 0;
+      if (state.board.winner === EMPTY && state.board.current !== state.humanColor) {
+        state.aiThinking = true;
+        pendingAiAt = 0;
+      }
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                    第 7 / 49 页
+------------------------------------------------------------------------------------------------
+      return { ok: done > 0, steps: done };
+    },
+    /** 触摸结束：按场景分发。 */
+    tap(px, py, now = 0) {
+      primeAudio();
+      /* ── 设置面板：优先拦截（模态） ── */
+      if (state.settingsOpen) {
+        const sv = sliderValueAt(settingsLayout, px, py);
+        if (sv !== null) { applyMusicVolume(sv); return { type: 'volume', value: state.settings.music }; }
+        if (hitRect(settingsLayout.close, px, py) || !hitRect(settingsLayout.panel, px, py)) {
+          state.settingsOpen = false;
+          return { type: 'settings-close' };
+        }
+        return { type: 'settings-noop' };
+      }
+      const L = api.activeLayout;
+      /* ── 齿轮（各场景通用） ── */
+      if (hitGear(L, px, py)) {
+        state.settingsOpen = true;
+        state.settingsLayout = settingsLayout;
+        state.press = null;
+        return { type: 'settings-open' };
+      }
+      switch (state.scene) {
+        case SCENE_HALL: {
+          const i = hitGame(hallLayout, px, py);
+          // GAMES 前若干项已实现；目前仅第 0 项可用
+          if (i === 0) { state.scene = SCENE_MODE; state.press = null; return { type: 'pick-game', index: i }; }
+          if (i > 0) { showToast('该棋类还在制作中', now); return { type: 'coming-soon', index: i }; }
+          state.press = null;
+          return { type: 'hall-miss' };
+        }
+        case SCENE_MODE: {
+          if (hitBack(modeLayout, px, py)) { state.scene = SCENE_HALL; state.press = null; return { type: 'back' }; }
+          const i = hitMode(modeLayout, px, py);
+          if (i >= 0) {
+            state.mode = MODE_ORDER[i];
+            state.scene = SCENE_LEVEL;
+            state.press = null;
+            return { type: 'pick-mode', mode: state.mode };
+          }
+          return { type: 'mode-miss' };
+        }
+        case SCENE_LEVEL: {
+          if (hitBack(levelLayout, px, py)) { state.scene = SCENE_MODE; state.press = null; return { type: 'back' }; }
+          const i = hitLevel(levelLayout, px, py);
+          if (i >= 0) {
+            state.level = LEVEL_ORDER[i];
+            state.press = null;
+            state.scene = SCENE_GAME;
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                    第 8 / 49 页
+------------------------------------------------------------------------------------------------
+            resetBoard(now);
+            return { type: 'start', mode: state.mode, level: state.level };
+          }
+          return { type: 'level-miss' };
+        }
+        default: {
+          /* ── 对局 ── */
+          if (hitBack(gameLayout, px, py)) {
+            // 取消对局：不计分直接回大厅
+            state.scene = SCENE_HALL;
+            state.toast = null;
+            pendingAiAt = 0;
+            state.aiThinking = false;
+            return { type: 'cancel' };
+          }
+          const idx = hitButton(gameLayout, px, py);
+          if (idx >= 0) {
+            state.pressIndex = -1;
+            if (idx === 0) { resetBoard(now); return { type: 'reset' }; }
+            if (idx === 1) return { type: 'undo', ...api.undoMove() };
+            if (idx === 2) return api.resign(now);
+          }
+          if (!isHumanTurn()) return { type: 'blocked', reason: state.aiThinking ? 'thinking' : 'not-your-turn' };
+          const { x, y } = gameLayout.board.fromScreen(px, py);
+          if (x < 0 || y < 0 || x >= BOARD_SIZE || y >= BOARD_SIZE) return { type: 'miss' };
+          const p = gameLayout.board.toScreen(x, y);
+          if (Math.hypot(px - p.x, py - p.y) > gameLayout.board.cell * 0.62) return { type: 'miss' };
+          if (!canPlace(state.board, x, y)) return { type: 'occupied' };
+          const verdict = checkMove(state.board.grid, state.board.size, x, y, state.board.current, state.mode);
+          if (!verdict.ok) {
+            showToast(verdict.reason, now);
+            return { type: 'forbidden', reason: verdict.reason };
+          }
+          const r = place(state.board, x, y);
+          if (!r.ok) return { type: 'reject', reason: r.reason };
+          state.hover = null;
+          markStoneAnim(x, y, now);
+          afterMove(now);
+          return { type: 'placed', x, y };
+        }
+      }
+    },
+    /** 按下反馈。 */
+    press(px, py) {
+      if (state.settingsOpen) return;
+      const L = api.activeLayout;
+      if (hitGear(L, px, py)) { state.press = { kind: 'gear' }; return; }
+      switch (state.scene) {
+        case SCENE_HALL: {
+          const i = hitGame(hallLayout, px, py);
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                    第 9 / 49 页
+------------------------------------------------------------------------------------------------
+          state.press = i >= 0 ? { kind: 'game', index: i } : null;
+          return;
+        }
+        case SCENE_MODE: {
+          if (hitBack(modeLayout, px, py)) { state.press = { kind: 'back' }; return; }
+          const i = hitMode(modeLayout, px, py);
+          state.press = i >= 0 ? { kind: 'mode', index: i } : null;
+          return;
+        }
+        case SCENE_LEVEL: {
+          if (hitBack(levelLayout, px, py)) { state.press = { kind: 'back' }; return; }
+          const i = hitLevel(levelLayout, px, py);
+          state.press = i >= 0 ? { kind: 'level', index: i } : null;
+          return;
+        }
+        default:
+          state.pressIndex = hitButton(gameLayout, px, py);
+      }
+    },
+    release() { state.pressIndex = -1; state.press = null; },
+    /** 悬停预告（同时用于拖动音量滑块时的实时更新）。 */
+    hover(px, py) {
+      if (state.settingsOpen) {
+        const sv = sliderValueAt(settingsLayout, px, py);
+        if (sv !== null) applyMusicVolume(sv);
+        return;
+      }
+      if (state.scene !== SCENE_GAME) { state.hover = null; return; }
+      if (!isHumanTurn()) { state.hover = null; return; }
+      const { x, y } = gameLayout.board.fromScreen(px, py);
+      if (x < 0 || y < 0 || x >= BOARD_SIZE || y >= BOARD_SIZE) { state.hover = null; return; }
+      const p = gameLayout.board.toScreen(x, y);
+      if (Math.hypot(px - p.x, py - p.y) > gameLayout.board.cell * 0.62) { state.hover = null; return; }
+      state.hover = { x, y, valid: canPlace(state.board, x, y) };
+    },
+    clearHover() { state.hover = null; },
+    update(now) {
+      if (state.scene !== SCENE_GAME) return;
+      if (state.board.winner !== EMPTY && (state.aiThinking || pendingAiAt !== 0)) {
+        state.aiThinking = false;
+        pendingAiAt = 0;
+      }
+      if (pendingAiAt !== 0 && now >= pendingAiAt && state.board.winner === EMPTY) {
+        pendingAiAt = 0;
+        const move = chooseMove(state.board, state.board.current, {
+          level: state.level,
+          mode: state.mode,
+        });
+        if (move) {
+          const r = place(state.board, move.x, move.y);
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 10 / 49 页
+------------------------------------------------------------------------------------------------
+          if (r.ok) markStoneAnim(move.x, move.y, now);
+          if (state.board.winner !== EMPTY) {
+            state.anim.overT0 = now;
+            settleScore();
+          }
+        }
+        state.aiThinking = false;
+      }
+    },
+    get busy() { return state.aiThinking || state.anim.stones.size > 0; },
+    /** 当前规则 · 难度（HUD 显示）。 */
+    get matchLabel() {
+      const lv = LEVELS[state.level] ?? LEVELS[2];
+      return `${RULE_LABELS[state.mode].name} · ${lv.name}`;
+    },
+    render(ctx, now) {
+      state.settingsLayout = settingsLayout;
+      switch (state.scene) {
+        case SCENE_HALL: renderHall(ctx, hallLayout, state, menuTheme); break;
+        case SCENE_MODE: renderMode(ctx, modeLayout, state, menuTheme); break;
+        case SCENE_LEVEL: renderLevel(ctx, levelLayout, state, menuTheme); break;
+        default: renderFrame(ctx, gameLayout, state, theme, now); break;
+      }
+      if (state.settingsOpen) renderSettings(ctx, api.activeLayout, state, menuTheme, now);
+    },
+  };
+  return api;
+}
+export { EMPTY, BLACK, WHITE, BOARD_SIZE, RULE_CASUAL, RULE_PRO, LEVELS, MODE_ORDER, LEVEL_ORDER, LEVEL_DESC };
+// ===== FILE: src/core/board.js =====
+/**
+ * 五子棋核心逻辑（纯函数，零依赖，可在 Node 里直接跑测试）
+ *
+ * 设计约束（沿用「荒潮拾荒者」的架构理念）：
+ *   - 本文件不碰任何平台 API（无 wx、无 document、无 canvas）；
+ *   - 棋盘状态是显式的，落子/胜负/悔棋全部可确定性复现；
+ *   - 为 UI 提供「最后落点」「胜利连线」「候选点」等渲染所需信息。
+ */
+export const BOARD_SIZE = 15;
+export const EMPTY = 0;
+export const BLACK = 1;
+export const WHITE = 2;
+/** 四个扫描方向：横、竖、主对角、副对角。 */
+const DIRECTIONS = [
+  [1, 0],
+  [0, 1],
+  [1, 1],
+  [1, -1],
+];
+/** 创建一个空棋盘状态。 */
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 11 / 49 页
+------------------------------------------------------------------------------------------------
+export function createBoard(size = BOARD_SIZE) {
+  const grid = [];
+  for (let y = 0; y < size; y++) grid.push(new Array(size).fill(EMPTY));
+  return {
+    size,
+    grid,
+    moves: [],        // 落子历史 [{x, y, player}]，用于悔棋
+    winner: EMPTY,    // EMPTY 表示未分胜负
+    winLine: null,    // 胜利连线 [[x,y], ...]，供 UI 高亮
+    current: BLACK,   // 当前该谁落子（黑先）
+  };
+}
+/** 返回对方的棋子颜色。 */
+export function opponent(player) {
+  return player === BLACK ? WHITE : BLACK;
+}
+/** 该点是否可落子。 */
+export function canPlace(board, x, y) {
+  return (
+    x >= 0 && y >= 0 && x < board.size && y < board.size &&
+    board.grid[y][x] === EMPTY && board.winner === EMPTY
+  );
+}
+/**
+ * 落子。就地修改棋盘并推进回合；若分出胜负则记录胜利连线。
+ * @returns {{ok: boolean, reason?: string, winLine?: Array<[number, number]>|null}}
+ */
+export function place(board, x, y) {
+  if (board.winner !== EMPTY) return { ok: false, reason: 'over' };
+  if (!canPlace(board, x, y)) return { ok: false, reason: 'occupied' };
+  const player = board.current;
+  board.grid[y][x] = player;
+  board.moves.push({ x, y, player });
+  const line = findWinLine(board, x, y, player);
+  if (line) {
+    board.winner = player;
+    board.winLine = line;
+  } else if (board.moves.length >= board.size * board.size) {
+    board.winner = -1; // 和棋
+  } else {
+    board.current = opponent(player);
+  }
+  return { ok: true, winLine: board.winLine };
+}
+/** 悔棋：撤回一步（回到上一手落子之前）。 */
+export function undo(board) {
+  if (board.moves.length === 0) return { ok: false, reason: 'empty' };
+  const last = board.moves.pop();
+  board.grid[last.y][last.x] = EMPTY;
+  board.winner = EMPTY;
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 12 / 49 页
+------------------------------------------------------------------------------------------------
+  board.winLine = null;
+  board.current = last.player;
+  return { ok: true, undone: last };
+}
+/**
+ * 检查落子后是否形成五连。
+ * @returns 胜利连线的坐标数组，未成五连则返回 null。
+ */
+export function findWinLine(board, x, y, player) {
+  for (const [dx, dy] of DIRECTIONS) {
+    const line = [[x, y]];
+    // 正方向
+    for (let step = 1; step < 5; step++) {
+      const nx = x + dx * step, ny = y + dy * step;
+      if (!inBounds(board, nx, ny) || board.grid[ny][nx] !== player) break;
+      line.push([nx, ny]);
+    }
+    // 反方向
+    for (let step = 1; step < 5; step++) {
+      const nx = x - dx * step, ny = y - dy * step;
+      if (!inBounds(board, nx, ny) || board.grid[ny][nx] !== player) break;
+      line.unshift([nx, ny]);
+    }
+    if (line.length >= 5) return line;
+  }
+  return null;
+}
+/** 坐标是否在棋盘内。 */
+export function inBounds(board, x, y) {
+  return x >= 0 && y >= 0 && x < board.size && y < board.size;
+}
+/** 最后一手（供 UI 画标记）。 */
+export function lastMove(board) {
+  return board.moves.length ? board.moves[board.moves.length - 1] : null;
+}
+/**
+ * 某点是否值得作为候选（周围两格内有棋子）——用于缩小 AI 搜索面。
+ */
+export function hasNeighbor(board, x, y, radius = 2) {
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      if (dx === 0 && dy === 0) continue;
+      const nx = x + dx, ny = y + dy;
+      if (inBounds(board, nx, ny) && board.grid[ny][nx] !== EMPTY) return true;
+    }
+  }
+  return false;
+}
+/**
+ * 生成候选落点：空位且附近有子。棋盘为空时返回天元。
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 13 / 49 页
+------------------------------------------------------------------------------------------------
+ */
+export function candidates(board, radius = 2) {
+  if (board.moves.length === 0) {
+    const c = Math.floor(board.size / 2);
+    return [[c, c]];
+  }
+  const out = [];
+  for (let y = 0; y < board.size; y++) {
+    for (let x = 0; x < board.size; x++) {
+      if (board.grid[y][x] !== EMPTY) continue;
+      if (hasNeighbor(board, x, y, radius)) out.push([x, y]);
+    }
+  }
+  return out;
+}
+/** 深拷贝一份棋盘状态（供 AI 试算，避免污染真实棋盘）。 */
+export function cloneBoard(board) {
+  return {
+    size: board.size,
+    grid: board.grid.map((row) => row.slice()),
+    moves: board.moves.map((m) => ({ ...m })),
+    winner: board.winner,
+    winLine: board.winLine,
+    current: board.current,
+  };
+}
+/** 胜负文案（UI 直接显示）。 */
+export function resultText(board) {
+  if (board.winner === BLACK) return '黑棋胜';
+  if (board.winner === WHITE) return '白棋胜';
+  if (board.winner === -1) return '和棋';
+  return '';
+}
+// ===== FILE: src/core/rules.js =====
+/**
+ * 规则集：休闲版 / 专业版
+ *
+ * 休闲版：无任何限制，先成五者胜（五连以上也算）。
+ * 专业版（连珠规则）：黑棋受禁手约束，白棋无禁手。
+ *   - 长连禁手：黑棋不得形成六子及以上连续
+ *   - 四四禁手：黑棋不得同时形成两个及以上的「四」
+ *   - 三三禁手：黑棋不得同时形成两个及以上的「活三」
+ *
+ * 实现思路（试填法，纯逻辑可测）：
+ *   把落点两侧各 5 格（共 11 格）取出成线串，1=己方 2=对方/出界 0=空；
+ *   「四」= 串中某个空位填成己方后恰好出现 11111；
+ *   「活三」= 串中某个空位填成己方后出现 011110（活四）。
+ *   四个方向各自最多计一个「四」/「活三」，避免同一方向重复计数。
+ */
+import { BLACK, WHITE, EMPTY, opponent } from './board.js';
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 14 / 49 页
+------------------------------------------------------------------------------------------------
+export const RULE_CASUAL = 'casual';
+export const RULE_PRO = 'pro';
+export const RULE_LABELS = {
+  [RULE_CASUAL]: { name: '休闲版', desc: '无规则限制，先成五者胜' },
+  [RULE_PRO]: { name: '专业版', desc: '黑棋禁手：三三 / 四四 / 长连' },
+};
+const DIRS = [[1, 0], [0, 1], [1, 1], [1, -1]];
+const WINDOW = 5; // 中心两侧各 5 格
+/** 取以 (x,y) 为中心、沿 (dx,dy) 的 11 格线串。出界记 2。 */
+function lineAt(grid, size, x, y, dx, dy, player) {
+  const foe = opponent(player);
+  let s = '';
+  for (let step = -WINDOW; step <= WINDOW; step++) {
+    if (step === 0) { s += '1'; continue; }
+    const nx = x + dx * step, ny = y + dy * step;
+    if (nx < 0 || ny < 0 || nx >= size || ny >= size) { s += '2'; continue; }
+    const v = grid[ny][nx];
+    s += v === EMPTY ? '0' : v === player ? '1' : v === foe ? '2' : '2';
+  }
+  return s;
+}
+/** 线串中是否有 ≥6 的连续 1（长连）。 */
+function hasOverline(line) {
+  return /111111/.test(line);
+}
+/** 线串中某空位填 1 后能否恰好成五（存在「四」）。 */
+function canFormFive(line) {
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] !== '0') continue;
+    const next = line.slice(0, i) + '1' + line.slice(i + 1);
+    if (/11111/.test(next) && !/111111/.test(next)) return true;
+  }
+  return false;
+}
+/** 线串中某空位填 1 后能否形成活四 011110（存在「活三」）。 */
+function canFormOpenFour(line) {
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] !== '0') continue;
+    const next = line.slice(0, i) + '1' + line.slice(i + 1);
+    if (next.includes('011110')) return true;
+  }
+  return false;
+}
+/**
+ * 分析在 (x,y) 落 player 后的形态统计。
+ * @returns {{overline:boolean, fours:number, openThrees:number}}
+ */
+export function analyzeShape(grid, size, x, y, player) {
+  let overline = false, fours = 0, openThrees = 0;
+  for (const [dx, dy] of DIRS) {
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 15 / 49 页
+------------------------------------------------------------------------------------------------
+    const line = lineAt(grid, size, x, y, dx, dy, player);
+    if (hasOverline(line)) overline = true;
+    if (canFormFive(line)) fours++;
+    if (canFormOpenFour(line)) openThrees++;
+  }
+  return { overline, fours, openThrees };
+}
+/**
+ * 判断黑棋在 (x,y) 落子是否触犯禁手（仅专业版调用）。
+ * @returns {{forbidden:boolean, reasons:string[]}}
+ */
+export function checkForbidden(grid, size, x, y) {
+  const s = analyzeShape(grid, size, x, y, BLACK);
+  const reasons = [];
+  if (s.overline) reasons.push('长连');
+  if (s.fours >= 2) reasons.push('四四');
+  if (s.openThrees >= 2) reasons.push('三三');
+  return { forbidden: reasons.length > 0, reasons };
+}
+/**
+ * 该手是否合法（综合规则集判定）。
+ * @param mode 'casual' | 'pro'
+ * @returns {{ok:boolean, reason?:string, forbiddenReasons?:string[]}}
+ */
+export function checkMove(grid, size, x, y, player, mode) {
+  if (mode !== RULE_PRO) return { ok: true };
+  // 专业版：只有黑棋受禁手约束
+  if (player !== BLACK) return { ok: true };
+  const r = checkForbidden(grid, size, x, y);
+  if (r.forbidden) {
+    return { ok: false, reason: '禁手：' + r.reasons.join(' + '), forbiddenReasons: r.reasons };
+  }
+  return { ok: true };
+}
+/** 规则说明文本（给 UI 用）。 */
+export function ruleHint(mode, player) {
+  if (mode !== RULE_PRO) return '休闲版：无禁手，任意落子';
+  if (player === BLACK) return '专业版：你执黑，三三 / 四四 / 长连为禁手';
+  return '专业版：你执白，白棋无禁手（对手黑棋受限）';
+}
+export { BLACK, WHITE, EMPTY };
+// ===== FILE: src/core/ai.js =====
+/**
+ * 五子棋 AI（纯逻辑，零依赖，可在 Node 里直接跑）
+ *
+ * 评估算法：方向段分析
+ *   对候选点，按「我方落此」与「对手落此」分别统计四个方向的连续段形态
+ *   （连子数 n + 两端开放数），查棋型表得分，再加权合成。
+ *
+ * 五档难度（难度越高，搜索越深、失误越少）：
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 16 / 49 页
+------------------------------------------------------------------------------------------------
+ *   1 简单   — 只看自己进攻、大量随机，偶尔漏防
+ *   2 普通   — 攻防兼顾（防守权重 0.9），轻微随机
+ *   3 困难   — 增加一步前瞻，会避开「我下完对手立刻活四」的坑
+ *   4 地狱   — 必堵点强制优先 + 主动制造双威胁（双三/双四）
+ *   5 亚洲   — 更宽的前瞻 + 对手反击后的二次校验 + 禁手感知，几乎不失误
+ *
+ * 规则感知：专业版（连珠）下，若 AI 执黑，会跳过所有禁手点（三三/四四/长连）。
+ */
+import { BOARD_SIZE, BLACK, WHITE, EMPTY, cloneBoard, place, candidates, opponent } from './board.js';
+import { checkForbidden, RULE_PRO } from './rules.js';
+/** 连子形态评分表：n = 落子后该方向连子总数，opens = 两端开放数。 */
+function shapeScore(n, opens) {
+  if (n >= 5) return 1_000_000;
+  if (n === 4 && opens === 2) return 120_000;
+  if (n === 4 && opens === 1) return 15_000;
+  if (n === 3 && opens === 2) return 9_000;
+  if (n === 3 && opens === 1) return 1_200;
+  if (n === 2 && opens === 2) return 700;
+  if (n === 2 && opens === 1) return 120;
+  if (n === 1 && opens === 2) return 30;
+  return 0;
+}
+const DIRS = [[1, 0], [0, 1], [1, 1], [1, -1]];
+function inside(board, x, y) {
+  return x >= 0 && y >= 0 && x < board.size && y < board.size;
+}
+/** 落子后某方向的形态分。 */
+function directionScore(board, x, y, player, dx, dy) {
+  let forward = 0, backward = 0, openForward = false, openBackward = false;
+  for (let step = 1; step <= 4; step++) {
+    const nx = x + dx * step, ny = y + dy * step;
+    if (!inside(board, nx, ny)) break;
+    const v = board.grid[ny][nx];
+    if (v === player) { forward++; continue; }
+    if (v === EMPTY) openForward = true;
+    break;
+  }
+  for (let step = 1; step <= 4; step++) {
+    const nx = x - dx * step, ny = y - dy * step;
+    if (!inside(board, nx, ny)) break;
+    const v = board.grid[ny][nx];
+    if (v === player) { backward++; continue; }
+    if (v === EMPTY) openBackward = true;
+    break;
+  }
+  const n = forward + backward + 1;
+  const opens = (openForward ? 1 : 0) + (openBackward ? 1 : 0);
+  return shapeScore(n, opens);
+}
+/** 单点评估：进攻分 + 对手在此的威胁分 × 防守权重。 */
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 17 / 49 页
+------------------------------------------------------------------------------------------------
+function evaluatePoint(board, x, y, player, defenseWeight = 0.95) {
+  const foe = opponent(player);
+  let attack = 0, defense = 0;
+  for (const [dx, dy] of DIRS) {
+    attack += directionScore(board, x, y, player, dx, dy);
+    defense += directionScore(board, x, y, foe, dx, dy);
+  }
+  return attack + defense * defenseWeight;
+}
+/** 分方向统计「四」与「活三」的个数（用于识别双威胁）。 */
+function threatProfile(board, x, y, player) {
+  let fours = 0, openThrees = 0;
+  for (const [dx, dy] of DIRS) {
+    const s = directionScore(board, x, y, player, dx, dy);
+    if (s >= 15_000 && s < 1_000_000) fours++;      // 冲四 / 活四
+    else if (s >= 9_000) openThrees++;              // 活三
+  }
+  return { fours, openThrees };
+}
+/** 该点落下是否立刻五连。 */
+function isWinningMove(board, x, y, player) {
+  const probe = cloneBoard(board);
+  probe.current = player;
+  probe.winner = EMPTY;
+  const r = place(probe, x, y);
+  return r.ok && probe.winner === player;
+}
+/** 该点是否为禁手（仅专业版黑棋需要）。 */
+function isForbidden(board, x, y, player, mode) {
+  if (mode !== RULE_PRO || player !== BLACK) return false;
+  return checkForbidden(board.grid, board.size, x, y).forbidden;
+}
+/** 难度参数表。 */
+export const LEVELS = {
+  1: { key: 1, name: '简单', defense: 0.25, noise: 1500, sample: 0.35, lookahead: 0, preBlock: false, doubleThreat: false },
+  2: { key: 2, name: '普通', defense: 0.9, noise: 40, sample: 1, lookahead: 0, preBlock: true, doubleThreat: false },
+  3: { key: 3, name: '困难', defense: 1.0, noise: 12, sample: 1, lookahead: 6, preBlock: true, doubleThreat: false },
+  4: { key: 4, name: '地狱', defense: 1.0, noise: 0, sample: 1, lookahead: 6, preBlock: true, doubleThreat: true },
+  5: { key: 5, name: '亚洲', defense: 1.0, noise: 0, sample: 1, lookahead: 9, preBlock: true, doubleThreat: true, verify: true },
+};
+export function levelName(level) {
+  return (LEVELS[level] ?? LEVELS[2]).name;
+}
+/**
+ * 选出 AI 的落点。
+ * @param board 当前棋盘
+ * @param player AI 执子颜色
+ * @param options.level 1..5（默认 2）
+ * @param options.mode 'casual' | 'pro'（专业版下禁手点会被排除）
+ * @returns {{x:number,y:number}|null}
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 18 / 49 页
+------------------------------------------------------------------------------------------------
+ */
+export function chooseMove(board, player, options = {}) {
+  const level = Math.min(5, Math.max(1, options.level ?? 2));
+  const mode = options.mode ?? 'casual';
+  const cfg = LEVELS[level];
+  const rand = options.random ?? Math.random;
+  if (board.moves.length === 0) {
+    const c = Math.floor(board.size / 2);
+    return { x: c, y: c };
+  }
+  let spots = candidates(board, 2);
+  // 专业版黑棋：先剔除禁手点
+  if (mode === RULE_PRO && player === BLACK) {
+    spots = spots.filter(([x, y]) => !isForbidden(board, x, y, player, mode));
+  }
+  if (spots.length === 0) return null;
+  // ① 一步致胜：任何难度都必须抓住。
+  //    必须放在「简单档抽样」之前——否则制胜点可能被随机抽掉，出现"该赢不赢"的怪象。
+  for (const [x, y] of spots) {
+    if (isWinningMove(board, x, y, player)) return { x, y };
+  }
+  // 简单档：随机抽样，制造"看不过来"的观感（只影响评分范围，不影响上面的必胜棋）
+  if (cfg.sample < 1) {
+    const keep = Math.max(4, Math.floor(spots.length * cfg.sample));
+    spots = spots.slice().sort(() => rand() - 0.5).slice(0, keep);
+  }
+  const center = (board.size - 1) / 2;
+  const scored = [];
+  for (const [x, y] of spots) {
+    // ① 自己一步致胜
+    if (isWinningMove(board, x, y, player)) return { x, y };
+    // ② 对手一步成五 → 必堵（简单档凭"看不见"漏防）
+    if (cfg.preBlock && isWinningMove(board, x, y, opponent(player))) {
+      scored.push({ x, y, score: 900_000 });
+      continue;
+    }
+    let score = evaluatePoint(board, x, y, player, cfg.defense);
+    // ④ 地狱/亚洲：主动制造双威胁（双四/双三）
+    if (cfg.doubleThreat) {
+      const tp = threatProfile(board, x, y, player);
+      if (tp.fours >= 2) score += 200_000;
+      else if (tp.fours >= 1 && tp.openThrees >= 1) score += 60_000;
+      else if (tp.openThrees >= 2) score += 40_000;
+    }
+    const dist = Math.abs(x - center) + Math.abs(y - center);
+    score -= dist * 2;
+    if (cfg.noise > 0) score += (rand() - 0.5) * cfg.noise;
+    scored.push({ x, y, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 19 / 49 页
+------------------------------------------------------------------------------------------------
+  let best = { x: scored[0].x, y: scored[0].y };
+  // ③ 前瞻
+  if (cfg.lookahead > 0) {
+    best = lookahead(board, player, scored.slice(0, cfg.lookahead), best, { ...cfg, mode });
+  }
+  return best;
+}
+/**
+ * 一步前瞻：模拟落子后看对手能拿到的最佳威胁，取「我方得分 − 对手反击分」最大者。
+ * verify=true（亚洲档）时再补一层：若对手反击后我方无法应对，则降低该点评价。
+ */
+function lookahead(board, player, top, fallback, cfg) {
+  const foe = opponent(player);
+  let best = fallback;
+  let bestValue = -Infinity;
+  for (const cand of top) {
+    const test = cloneBoard(board);
+    test.current = player;
+    test.winner = EMPTY;
+    const r = place(test, cand.x, cand.y);
+    if (!r.ok) continue;
+    if (test.winner === player) return { x: cand.x, y: cand.y };
+    // 对手最佳回应
+    let foeBest = 0;
+    let foeKiller = null;
+    let foeSpots = candidates(test, 2);
+    if (cfg.mode === RULE_PRO && foe === BLACK) {
+      foeSpots = foeSpots.filter(([x, y]) => !isForbidden(test, x, y, foe, cfg.mode));
+    }
+    for (const [fx, fy] of foeSpots) {
+      if (isWinningMove(test, fx, fy, foe)) { foeBest = 1_000_000; foeKiller = { x: fx, y: fy }; break; }
+      const s = evaluatePoint(test, fx, fy, foe, 0);
+      if (s > foeBest) { foeBest = s; foeKiller = { x: fx, y: fy }; }
+    }
+    let value = cand.score - foeBest * 0.9;
+    // 亚洲档：对手反击后，检查我方是否还有解（有解则加分，无解则重罚）
+    if (cfg.verify && foeKiller && foeBest >= 9_000) {
+      const after = cloneBoard(test);
+      after.current = foe;
+      after.winner = EMPTY;
+      place(after, foeKiller.x, foeKiller.y);
+      if (after.winner === foe) {
+        value -= 500_000;                     // 对手直接赢 → 这点不能走
+      } else {
+        after.current = player;
+        const replies = candidates(after, 2);
+        const hasAnswer = replies.some(([rx, ry]) => {
+          if (isWinningMove(after, rx, ry, player)) return true;
+          return evaluatePoint(after, rx, ry, player, 1.0) >= 100_000;
+        });
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 20 / 49 页
+------------------------------------------------------------------------------------------------
+        if (!hasAnswer) value -= 60_000;      // 无解 → 降权
+        else value += 8_000;
+      }
+    }
+    if (value > bestValue) { bestValue = value; best = { x: cand.x, y: cand.y }; }
+  }
+  return best;
+}
+export { evaluatePoint as __evaluatePoint, shapeScore as __shapeScore, directionScore as __directionScore, threatProfile as __threatProfile };
+export { BOARD_SIZE, BLACK, WHITE, EMPTY };
+// ===== FILE: src/ui/theme.js =====
+/**
+ * 主题令牌（纯数据，无平台依赖）
+ *
+ * 两套视觉：
+ *   THEME —— 对局界面：深色底衬托暖木棋盘，棋子用径向渐变做实体感
+ *   MENU  —— 主界面：青白渐变底 + 木质感卡片/按钮（与棋盘同一套木色）
+ */
+export const THEME = {
+  // ── 底色与容器 ──
+  bgTop: '#161a26',
+  bgBottom: '#0c0e15',
+  panel: 'rgba(255,255,255,0.06)',
+  panelBorder: 'rgba(255,255,255,0.10)',
+  // ── 棋盘（木色）──
+  boardTop: '#efcb92',
+  boardBottom: '#d8a860',
+  boardEdge: '#b1823a',
+  boardEdgeSoft: 'rgba(255,240,210,0.55)',
+  boardShadow: 'rgba(0,0,0,0.5)',
+  gridLine: 'rgba(86,52,18,0.5)',
+  gridLineStrong: 'rgba(70,40,12,0.72)',
+  starPoint: 'rgba(70,40,12,0.9)',
+  hoverGhost: 'rgba(20,20,26,0.30)',
+  // ── 棋子 ──
+  stoneBlackHi: '#5a5a68',
+  stoneBlackMid: '#23232c',
+  stoneBlackLo: '#0a0a0e',
+  stoneWhiteHi: '#ffffff',
+  stoneWhiteMid: '#f0f0f4',
+  stoneWhiteLo: '#b9b9c6',
+  stoneShadow: 'rgba(0,0,0,0.5)',
+  // ── 文字与强调 ──
+  textPrimary: '#f2f3f7',
+  textMuted: 'rgba(242,243,247,0.55)',
+  accent: '#f0b429',
+  accentSoft: 'rgba(240,180,41,0.20)',
+  danger: '#ef5f5f',
+  success: '#4ade80',
+  // ── 按钮 ──
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 21 / 49 页
+------------------------------------------------------------------------------------------------
+  btnBg: 'rgba(255,255,255,0.08)',
+  btnBgPressed: 'rgba(255,255,255,0.16)',
+  btnBorder: 'rgba(255,255,255,0.14)',
+  btnPrimaryBg: 'rgba(240,180,41,0.16)',
+  btnPrimaryBorder: 'rgba(240,180,41,0.45)',
+  // ── 字号（逻辑像素）──
+  fontTitle: 22,
+  fontHud: 14,
+  fontBtn: 15,
+  fontBig: 34,
+  fontSmall: 12,
+  // ── 节奏 ──
+  placeAnimMs: 140,
+  winPulseMs: 1200,
+  aiThinkMinMs: 260,
+};
+/** 主界面主题：青白渐变 + 木质感。 */
+export const MENU = {
+  // 背景：青 → 白
+  bgTop: '#d7ecec',
+  bgMid: '#e9f5f5',
+  bgBottom: '#fbfdfd',
+  // 木质元素（与棋盘同一套色）
+  woodTop: '#eec98f',
+  woodBottom: '#d9a95f',
+  woodEdge: '#b98a41',
+  woodDeep: '#8a5f22',
+  woodInk: '#5c3d10',
+  cardBg: 'rgba(255,255,255,0.78)',
+  cardBorder: 'rgba(150,110,50,0.28)',
+  cardShadow: 'rgba(90,70,30,0.18)',
+  selectedTop: '#e9bd75',
+  selectedBottom: '#cf9a4c',
+  selectedText: '#4a2f08',
+  textTitle: '#2f4f4a',
+  textBody: '#3d5b56',
+  textMuted: 'rgba(61,91,86,0.62)',
+  textOnWood: '#4a2f08',
+  accentLine: 'rgba(120,170,165,0.55)',
+  fontTitle: 30,
+  fontSub: 13,
+  fontCard: 17,
+  fontCardSub: 11,
+  fontLevel: 14,
+  fontStart: 18,
+};
+// ===== FILE: src/ui/layout.js =====
+/**
+ * 布局：把「屏幕尺寸」换算成各区块几何信息（纯函数，无平台依赖）
+ *
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 22 / 49 页
+------------------------------------------------------------------------------------------------
+ * 安全区（重要）：
+ *   手机底部常有手势条/导航条、顶部有状态栏与刘海。布局必须把这两块让出来，
+ *   否则底部按钮会被推出屏幕外（实机验证过的坑）。
+ *   调用方传入 insets = { top, bottom }（逻辑像素），本模块负责让位。
+ *
+ * 两套布局：
+ *   computeLayout      —— 对局界面（棋盘 + HUD + 按钮）
+ *   computeMenuLayout  —— 主界面（标题 + 模式选择 + 难度选择 + 开始）
+ */
+import { BOARD_SIZE } from '../core/board.js';
+const DIRS = [[1, 0], [0, 1], [1, 1], [1, -1]];
+/** 通用：安全区归一化。 */
+function normalizeInsets(insets = {}) {
+  const top = Math.max(0, Math.round(insets.top ?? 0));
+  const bottom = Math.max(0, Math.round(insets.bottom ?? 0));
+  return { top, bottom };
+}
+/* ─────────────────── 对局界面 ─────────────────── */
+export function computeLayout(width, height, insets = {}) {
+  const safe = normalizeInsets(insets);
+  const pad = Math.round(Math.min(width, height) * 0.045) || 16;
+  // 可用纵向空间（扣掉上下安全区）
+  const usableTop = safe.top;
+  const usableBottom = height - safe.bottom;
+  const usableH = usableBottom - usableTop;
+  // 顶部信息区：标题 + 执子/步数
+  const hudH = Math.round(Math.min(104, usableH * 0.13));
+  // 底部按钮区（含安全区让位）
+  const footerH = Math.round(Math.min(132, usableH * 0.17));
+  // 棋盘：正方形，取宽/高较小者
+  const availW = width - pad * 2;
+  const availH = usableH - hudH - footerH - pad;
+  const boardOuter = Math.max(160, Math.min(availW, availH));
+  const boardX = Math.round((width - boardOuter) / 2);
+  const boardY = Math.round(usableTop + hudH + (usableH - hudH - footerH - boardOuter) / 2);
+  const inner = Math.round(boardOuter * 0.045);
+  const gridSize = boardOuter - inner * 2;
+  const cell = gridSize / (BOARD_SIZE - 1);
+  const stoneR = cell * 0.44;
+  // 底部按钮：贴住"可用底边"再留 pad
+  const btnGap = Math.round(pad * 0.6);
+  const btnCount = 3;
+  const btnW = Math.floor((width - pad * 2 - btnGap * (btnCount - 1)) / btnCount);
+  const btnH = Math.max(38, Math.round(footerH * 0.42));
+  const btnY = Math.round(usableBottom - pad - btnH);
+  const buttons = [];
+  for (let i = 0; i < btnCount; i++) {
+    buttons.push({ x: pad + i * (btnW + btnGap), y: btnY, w: btnW, h: btnH });
+  }
+  return {
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 23 / 49 页
+------------------------------------------------------------------------------------------------
+    width,
+    height,
+    safe,
+    pad,
+    hud: { x: pad, y: usableTop, w: width - pad * 2, h: hudH },
+    board: {
+      x: boardX,
+      y: boardY,
+      size: boardOuter,
+      inner,
+      cell,
+      stoneR,
+      toScreen(gx, gy) {
+        return { x: boardX + inner + gx * cell, y: boardY + inner + gy * cell };
+      },
+      fromScreen(px, py) {
+        return {
+          x: Math.round((px - boardX - inner) / cell),
+          y: Math.round((py - boardY - inner) / cell),
+        };
+      },
+    },
+    buttons,
+    footer: { y: usableBottom - footerH, h: footerH },
+    // 左上角返回 / 右上角设置齿轮
+    ...(() => {
+      const size = Math.max(30, Math.round(pad * 2.1));
+      return {
+        back: { x: pad, y: usableTop + 4, w: size, h: size },
+        gear: { x: width - pad - size, y: usableTop + 4, w: size, h: size },
+      };
+    })(),
+  };
+}
+/* ─────────────────── 主界面 ─────────────────── */
+/**
+ * 主界面布局。
+ * @param modes 模式数量（固定 2：休闲 / 专业）
+ * @param levels 难度数量（固定 5）
+ */
+export function computeMenuLayout(width, height, insets = {}, modes = 2, levels = 5) {
+  const safe = normalizeInsets(insets);
+  const pad = Math.round(Math.min(width, height) * 0.055) || 18;
+  const usableTop = safe.top;
+  const usableBottom = height - safe.bottom;
+  const usableH = usableBottom - usableTop;
+  // 纵向节奏：标题 28% / 模式 20% / 难度 26% / 开始 26%
+  const titleH = Math.round(usableH * 0.28);
+  const modeH = Math.round(usableH * 0.20);
+  const levelH = Math.round(usableH * 0.26);
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 24 / 49 页
+------------------------------------------------------------------------------------------------
+  const title = { x: pad, y: usableTop, w: width - pad * 2, h: titleH };
+  // 模式卡片：横向两张
+  const modeGap = Math.round(pad * 0.7);
+  const modeW = Math.floor((width - pad * 2 - modeGap * (modes - 1)) / modes);
+  const modeCardH = Math.round(modeH * 0.72);
+  const modeY = usableTop + titleH + Math.round(modeH * 0.10);
+  const modeCards = [];
+  for (let i = 0; i < modes; i++) {
+    modeCards.push({ x: pad + i * (modeW + modeGap), y: modeY, w: modeW, h: modeCardH });
+  }
+  // 难度：一排 5 个胶囊（窄屏自动两行），在所属区域内垂直居中，避免中间留大片空白
+  const levelTop = usableTop + titleH + modeH;
+  const levelCards = [];
+  const perRow = width < 340 ? 3 : levels;
+  const rows = Math.ceil(levels / perRow);
+  const lvGap = Math.round(pad * 0.45);
+  const lvW = Math.floor((width - pad * 2 - lvGap * (perRow - 1)) / perRow);
+  const lvH = Math.max(34, Math.round(levelH * 0.34));
+  const lvBlockH = rows * lvH + (rows - 1) * lvGap;
+  const lvStartY = levelTop + Math.max(0, Math.round((levelH - lvBlockH) / 2));
+  for (let i = 0; i < levels; i++) {
+    const r = Math.floor(i / perRow), c = i % perRow;
+    levelCards.push({
+      x: pad + c * (lvW + lvGap),
+      y: lvStartY + r * (lvH + lvGap),
+      w: lvW,
+      h: lvH,
+    });
+  }
+  // 开始按钮
+  const startW = Math.min(width - pad * 2, 320);
+  const startH = Math.max(46, Math.round(usableH * 0.075));
+  const start = {
+    x: Math.round((width - startW) / 2),
+    y: Math.round(usableBottom - pad - startH),
+    w: startW,
+    h: startH,
+  };
+  return {
+    width, height, safe, pad,
+    title,
+    modeCards,
+    levelCards,
+    start,
+    rows: { perRow, count: levels },
+  };
+}
+/* ─────────────────── 通用小部件 ─────────────────── */
+/** 左上角返回键 + 右上角设置齿轮（各界面共用）。 */
+function cornerWidgets(width, insets, pad) {
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 25 / 49 页
+------------------------------------------------------------------------------------------------
+  const size = Math.max(32, Math.round(pad * 2.0));
+  return {
+    back: { x: pad, y: insets.top + 6, w: size, h: size },
+    gear: { x: width - pad - size, y: insets.top + 6, w: size, h: size },
+  };
+}
+/* ─────────────────── 大厅：游戏列表 ─────────────────── */
+/**
+ * 「纯净玩」大厅布局：标题 + 游戏卡片网格（每行 2 个）。
+ * @param games 游戏数量
+ */
+export function computeHallLayout(width, height, insets = {}, games = 1) {
+  const safe = normalizeInsets(insets);
+  const pad = Math.round(Math.min(width, height) * 0.055) || 18;
+  const usableTop = safe.top;
+  const usableBottom = height - safe.bottom;
+  const usableH = usableBottom - usableTop;
+  const titleH = Math.round(usableH * 0.22);
+  const title = { x: pad, y: usableTop, w: width - pad * 2, h: titleH };
+  const corners = cornerWidgets(width, safe, pad);
+  // 卡片网格
+  const cols = 2;
+  const gap = Math.round(pad * 0.7);
+  const cardW = Math.floor((width - pad * 2 - gap * (cols - 1)) / cols);
+  const cardH = Math.round(cardW * 1.15);
+  const gridTop = usableTop + titleH;
+  const cards = [];
+  for (let i = 0; i < games; i++) {
+    const r = Math.floor(i / cols), c = i % cols;
+    cards.push({
+      x: pad + c * (cardW + gap),
+      y: gridTop + r * (cardH + gap),
+      w: cardW,
+      h: cardH,
+    });
+  }
+  return {
+    width, height, safe, pad,
+    title,
+    cards,
+    ...corners,
+    hint: { x: pad, y: usableBottom - Math.round(pad * 1.6), w: width - pad * 2, h: Math.round(pad * 1.6) },
+  };
+}
+/* ─────────────────── 模式：上下并排两大块 ─────────────────── */
+export function computeModeLayout(width, height, insets = {}, modes = 2) {
+  const safe = normalizeInsets(insets);
+  const pad = Math.round(Math.min(width, height) * 0.055) || 18;
+  const usableTop = safe.top;
+  const usableBottom = height - safe.bottom;
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 26 / 49 页
+------------------------------------------------------------------------------------------------
+  const usableH = usableBottom - usableTop;
+  const titleH = Math.round(usableH * 0.17);
+  const title = { x: pad, y: usableTop, w: width - pad * 2, h: titleH };
+  const corners = cornerWidgets(width, safe, pad);
+  // 上下两块：给块高设上限并整体垂直居中，避免长屏上"两块各占半屏、内部空旷"
+  const areaTop = usableTop + titleH;
+  const areaH = usableBottom - areaTop - pad;
+  const gap = Math.round(pad * 0.8);
+  const maxBlockH = Math.round(usableH * 0.26);
+  const rawH = Math.floor((areaH - gap * (modes - 1)) / modes);
+  const blockH = Math.max(96, Math.min(rawH, maxBlockH));
+  const totalH = blockH * modes + gap * (modes - 1);
+  const startY = areaTop + Math.max(0, Math.round((areaH - totalH) / 2));
+  const blocks = [];
+  for (let i = 0; i < modes; i++) {
+    blocks.push({
+      x: pad,
+      y: startY + i * (blockH + gap),
+      w: width - pad * 2,
+      h: blockH,
+    });
+  }
+  return { width, height, safe, pad, title, blocks, ...corners };
+}
+/* ─────────────────── 难度：竖排列表 ─────────────────── */
+export function computeLevelLayout(width, height, insets = {}, levels = 5, modeName = '') {
+  const safe = normalizeInsets(insets);
+  const pad = Math.round(Math.min(width, height) * 0.055) || 18;
+  const usableTop = safe.top;
+  const usableBottom = height - safe.bottom;
+  const usableH = usableBottom - usableTop;
+  const titleH = Math.round(usableH * 0.17);
+  const title = { x: pad, y: usableTop, w: width - pad * 2, h: titleH, modeName };
+  const corners = cornerWidgets(width, safe, pad);
+  const areaTop = usableTop + titleH;
+  const areaH = usableBottom - areaTop - pad;
+  const gap = Math.round(pad * 0.5);
+  const rowH = Math.min(Math.round(areaH / levels) - gap, Math.round(usableH * 0.1));
+  const blockH = levels * rowH + (levels - 1) * gap;
+  const startY = areaTop + Math.max(0, Math.round((areaH - blockH) / 2));
+  const rows = [];
+  for (let i = 0; i < levels; i++) {
+    rows.push({ x: pad, y: startY + i * (rowH + gap), w: width - pad * 2, h: rowH });
+  }
+  return { width, height, safe, pad, title, rows, ...corners };
+}
+/* ─────────────────── 设置面板 ─────────────────── */
+export function computeSettingsLayout(width, height, insets = {}) {
+  const safe = normalizeInsets(insets);
+  const pad = Math.round(width * 0.08);
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 27 / 49 页
+------------------------------------------------------------------------------------------------
+  const panelW = Math.min(width - pad * 2, 340);
+  const panelH = Math.min(Math.round(panelW * 1.05), height - safe.top - safe.bottom - pad * 2);
+  const x = Math.round((width - panelW) / 2);
+  const y = Math.round(safe.top + (height - safe.top - safe.bottom - panelH) / 2);
+  const sliderH = 8;
+  const knobR = 13;
+  const sliderW = panelW - pad * 2;
+  const sliderX = x + pad;
+  const sliderY = y + Math.round(panelH * 0.42);
+  return {
+    width, height, safe, pad,
+    panel: { x, y, w: panelW, h: panelH },
+    slider: { x: sliderX, y: sliderY, w: sliderW, h: sliderH, knobR },
+    close: {
+      x: x + panelW - pad - 30,
+      y: y + Math.round(panelH * 0.08),
+      w: 30, h: 30,
+    },
+    // 面板内两行文字位置
+    titleY: y + Math.round(panelH * 0.16),
+    labelY: y + Math.round(panelH * 0.30),
+    valueY: y + Math.round(panelH * 0.58),
+    hintY: y + Math.round(panelH * 0.74),
+  };
+}
+/* ─────────────────── 命中测试 ─────────────────── */
+export function hitRect(rect, x, y) {
+  return x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h;
+}
+export function hitButton(layout, x, y) {
+  return layout.buttons.findIndex((b) => hitRect(b, x, y));
+}
+/** 命中卡片/块/行等矩形数组，返回索引（-1 未命中）。 */
+export function hitList(list, x, y) {
+  return (list ?? []).findIndex((r) => hitRect(r, x, y));
+}
+export function hitMode(layout, x, y) { return hitList(layout.blocks, x, y); }
+export function hitLevel(layout, x, y) { return hitList(layout.rows, x, y); }
+export function hitGame(layout, x, y) { return hitList(layout.cards, x, y); }
+export function hitBack(layout, x, y) { return hitRect(layout.back, x, y); }
+export function hitGear(layout, x, y) { return hitRect(layout.gear, x, y); }
+/** 设置面板里命中滑块（返回 0..1 的位置，未命中返回 null）。 */
+export function sliderValueAt(layout, x, y) {
+  const s = layout.slider;
+  const touchPad = 26; // 纵向扩大命中范围，方便手指按住
+  if (y < s.y - touchPad || y > s.y + s.h + touchPad) return null;
+  if (x < s.x - s.knobR || x > s.x + s.w + s.knobR) return null;
+  return Math.max(0, Math.min(1, (x - s.x) / s.w));
+}
+// ===== FILE: src/ui/renderer.js =====
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 28 / 49 页
+------------------------------------------------------------------------------------------------
+/**
+ * 绘制层：只负责「把状态画出来」，不持有状态、不碰平台 API。
+ * 同一份代码同时供微信小游戏（ctx from wx.createCanvas）与浏览器预览使用。
+ */
+import { BOARD_SIZE, EMPTY, BLACK, WHITE } from '../core/board.js';
+import { RULE_LABELS } from '../core/rules.js';
+import { LEVELS } from '../core/ai.js';
+const FONT = '-apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif';
+/* ───────────────────────── 基础工具 ───────────────────────── */
+/** 圆角矩形路径（不依赖 ctx.roundRect，兼容小游戏基础库）。 */
+export function pathRoundRect(ctx, x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.lineTo(x + w - rr, y);
+  ctx.arcTo(x + w, y, x + w, y + rr, rr);
+  ctx.lineTo(x + w, y + h - rr);
+  ctx.arcTo(x + w, y + h, x + w - rr, y + h, rr);
+  ctx.lineTo(x + rr, y + h);
+  ctx.arcTo(x, y + h, x, y + h - rr, rr);
+  ctx.lineTo(x, y + rr);
+  ctx.arcTo(x, y, x + rr, y, rr);
+  ctx.closePath();
+}
+/** easeOutBack：落子弹出用的轻微过冲曲线。 */
+function easeOutBack(t) {
+  const c1 = 1.70158, c3 = c1 + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+}
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+/* ───────────────────────── 背景 ───────────────────────── */
+export function drawBackground(ctx, layout, theme) {
+  const g = ctx.createLinearGradient(0, 0, 0, layout.height);
+  g.addColorStop(0, theme.bgTop);
+  g.addColorStop(1, theme.bgBottom);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, layout.width, layout.height);
+  // 棋盘后方的柔光，让视线聚焦中央
+  const b = layout.board;
+  const glow = ctx.createRadialGradient(
+    b.x + b.size / 2, b.y + b.size / 2, b.size * 0.15,
+    b.x + b.size / 2, b.y + b.size / 2, b.size * 0.85,
+  );
+  glow.addColorStop(0, 'rgba(240,180,41,0.10)');
+  glow.addColorStop(1, 'rgba(240,180,41,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, layout.width, layout.height);
+}
+/* ───────────────────────── 棋盘 ───────────────────────── */
+export function drawBoard(ctx, layout, theme) {
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 29 / 49 页
+------------------------------------------------------------------------------------------------
+  const b = layout.board;
+  const r = Math.round(b.size * 0.05);
+  // 木框投影
+  ctx.save();
+  ctx.shadowColor = theme.boardShadow;
+  ctx.shadowBlur = Math.round(b.size * 0.05);
+  ctx.shadowOffsetY = Math.round(b.size * 0.012);
+  pathRoundRect(ctx, b.x, b.y, b.size, b.size, r);
+  ctx.fillStyle = theme.boardDark;
+  ctx.fill();
+  ctx.restore();
+  // 木色：垂直柔和渐变（早先用对角三色标，会产生"棋盘分块"的错觉，已替换）
+  const wood = ctx.createLinearGradient(0, b.y, 0, b.y + b.size);
+  wood.addColorStop(0, theme.boardTop);
+  wood.addColorStop(1, theme.boardBottom);
+  pathRoundRect(ctx, b.x, b.y, b.size, b.size, r);
+  ctx.fillStyle = wood;
+  ctx.fill();
+  // 木纹：极低对比的横向细纹，密度随棋盘尺寸自适应
+  ctx.save();
+  pathRoundRect(ctx, b.x, b.y, b.size, b.size, r);
+  ctx.clip();
+  ctx.globalAlpha = 0.032;
+  ctx.strokeStyle = '#6b3f12';
+  ctx.lineWidth = 1;
+  const step = Math.max(2, Math.round(b.size / 150));
+  for (let y = b.y; y < b.y + b.size; y += step * 3) {
+    const wobble = Math.sin(y * 0.35) * (b.size * 0.004);
+    ctx.beginPath();
+    ctx.moveTo(b.x, y + wobble);
+    ctx.lineTo(b.x + b.size, y + wobble * 0.4);
+    ctx.stroke();
+  }
+  ctx.restore();
+  // 内阴影（木框立体感）
+  ctx.save();
+  pathRoundRect(ctx, b.x, b.y, b.size, b.size, r);
+  ctx.clip();
+  const vig = ctx.createRadialGradient(
+    b.x + b.size / 2, b.y + b.size / 2, b.size * 0.3,
+    b.x + b.size / 2, b.y + b.size / 2, b.size * 0.78,
+  );
+  vig.addColorStop(0, 'rgba(0,0,0,0)');
+  vig.addColorStop(1, 'rgba(90,52,16,0.22)');
+  ctx.fillStyle = vig;
+  ctx.fillRect(b.x, b.y, b.size, b.size);
+  ctx.restore();
+  // 边框：外深 + 内亮，做出木框倒角
+  pathRoundRect(ctx, b.x + 0.5, b.y + 0.5, b.size - 1, b.size - 1, r);
+  ctx.strokeStyle = theme.boardEdge;
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 30 / 49 页
+------------------------------------------------------------------------------------------------
+  ctx.lineWidth = Math.max(1.2, b.size * 0.0075);
+  ctx.stroke();
+  pathRoundRect(ctx, b.x + b.inner * 0.55, b.y + b.inner * 0.55, b.size - b.inner * 1.1, b.size - b.inner * 1.1, r * 0.55);
+  ctx.strokeStyle = theme.boardEdgeSoft;
+  ctx.lineWidth = Math.max(1, b.size * 0.0028);
+  ctx.stroke();
+  // 网格线（内部细线）
+  ctx.save();
+  ctx.strokeStyle = theme.gridLine;
+  ctx.lineWidth = Math.max(1, b.size * 0.0035);
+  ctx.lineCap = 'round';
+  const p0 = b.toScreen(0, 0);
+  const pN = b.toScreen(BOARD_SIZE - 1, BOARD_SIZE - 1);
+  for (let i = 0; i < BOARD_SIZE; i++) {
+    const v = b.toScreen(i, 0);
+    const h = b.toScreen(0, i);
+    ctx.beginPath(); ctx.moveTo(v.x, p0.y); ctx.lineTo(v.x, pN.y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(p0.x, h.y); ctx.lineTo(pN.x, h.y); ctx.stroke();
+  }
+  // 最外圈加重，棋盘边缘更挺
+  ctx.strokeStyle = theme.gridLineStrong;
+  ctx.lineWidth = Math.max(1.4, b.size * 0.005);
+  ctx.strokeRect(p0.x, p0.y, pN.x - p0.x, pN.y - p0.y);
+  ctx.restore();
+  // 星位（天元 + 四角星）
+  const stars = [[3, 3], [11, 3], [3, 11], [11, 11], [7, 7]];
+  ctx.fillStyle = theme.starPoint;
+  for (const [gx, gy] of stars) {
+    const p = b.toScreen(gx, gy);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, Math.max(2, b.cell * 0.09), 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+/* ───────────────────────── 棋子 ───────────────────────── */
+/** 画一颗棋子（带立体感的高光与投影）。 */
+function drawStone(ctx, cx, cy, r, color, theme) {
+  ctx.save();
+  // 投影
+  ctx.beginPath();
+  ctx.arc(cx + r * 0.10, cy + r * 0.14, r, 0, Math.PI * 2);
+  ctx.fillStyle = theme.stoneShadow;
+  ctx.fill();
+  // 球体渐变
+  const g = ctx.createRadialGradient(
+    cx - r * 0.34, cy - r * 0.38, r * 0.06,
+    cx, cy, r * 1.06,
+  );
+  if (color === BLACK) {
+    g.addColorStop(0, theme.stoneBlackHi);
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 31 / 49 页
+------------------------------------------------------------------------------------------------
+    g.addColorStop(0.45, theme.stoneBlackMid);
+    g.addColorStop(1, theme.stoneBlackLo);
+  } else {
+    g.addColorStop(0, theme.stoneWhiteHi);
+    g.addColorStop(0.55, theme.stoneWhiteMid);
+    g.addColorStop(1, theme.stoneWhiteLo);
+  }
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fillStyle = g;
+  ctx.fill();
+  // 高光小点
+  ctx.beginPath();
+  ctx.arc(cx - r * 0.34, cy - r * 0.38, r * 0.20, 0, Math.PI * 2);
+  ctx.fillStyle = color === BLACK ? 'rgba(255,255,255,0.30)' : 'rgba(255,255,255,0.95)';
+  ctx.fill();
+  // 轮廓
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.strokeStyle = color === BLACK ? 'rgba(255,255,255,0.10)' : 'rgba(0,0,0,0.18)';
+  ctx.lineWidth = Math.max(1, r * 0.06);
+  ctx.stroke();
+  ctx.restore();
+}
+export function drawStones(ctx, layout, state, theme, now) {
+  const b = layout.board;
+  const anim = state.anim ?? {};
+  for (let gy = 0; gy < BOARD_SIZE; gy++) {
+    for (let gx = 0; gx < BOARD_SIZE; gx++) {
+      const v = state.board.grid[gy][gx];
+      if (v === EMPTY) continue;
+      const p = b.toScreen(gx, gy);
+      // 落子弹出动画（只对最近落下的子生效）
+      let scale = 1;
+      const t0 = anim.stones && anim.stones.get(`${gx},${gy}`);
+      if (t0 !== undefined) {
+        const t = clamp01((now - t0) / theme.placeAnimMs);
+        scale = t >= 1 ? 1 : Math.max(0.05, easeOutBack(t));
+      }
+      drawStone(ctx, p.x, p.y, b.stoneR * scale, v, theme);
+    }
+  }
+}
+/* ───────────────────────── 最后一手 / 胜利 ───────────────────────── */
+export function drawLastMarker(ctx, layout, state, theme, now) {
+  const last = state.board.moves[state.board.moves.length - 1];
+  if (!last || state.board.winner !== EMPTY) return;
+  const p = layout.board.toScreen(last.x, last.y);
+  const r = layout.board.stoneR;
+  // 呼吸光环
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 32 / 49 页
+------------------------------------------------------------------------------------------------
+  const pulse = 0.5 + 0.5 * Math.sin((now ?? 0) / 420);
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, r * (1.12 + pulse * 0.10), 0, Math.PI * 2);
+  ctx.strokeStyle = theme.accent;
+  ctx.globalAlpha = 0.55 + pulse * 0.35;
+  ctx.lineWidth = Math.max(1.2, r * 0.14);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+  // 中心小点（与棋子反色）
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, r * 0.16, 0, Math.PI * 2);
+  ctx.fillStyle = last.player === BLACK ? theme.accent : '#8a5a10';
+  ctx.fill();
+}
+export function drawWin(ctx, layout, state, theme, now) {
+  const line = state.board.winLine;
+  if (!line || state.board.winner === EMPTY || state.board.winner === -1) return;
+  const b = layout.board;
+  const pulse = 0.5 + 0.5 * Math.sin((now ?? 0) / 300);
+  // 连线
+  const a = b.toScreen(line[0][0], line[0][1]);
+  const z = b.toScreen(line[line.length - 1][0], line[line.length - 1][1]);
+  ctx.save();
+  ctx.strokeStyle = theme.accent;
+  ctx.globalAlpha = 0.45 + pulse * 0.35;
+  ctx.lineWidth = Math.max(2, b.stoneR * 0.5);
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(z.x, z.y);
+  ctx.stroke();
+  ctx.restore();
+  // 五子高亮环
+  for (const [gx, gy] of line) {
+    const p = b.toScreen(gx, gy);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, b.stoneR * (1.18 + pulse * 0.12), 0, Math.PI * 2);
+    ctx.strokeStyle = theme.accent;
+    ctx.lineWidth = Math.max(2, b.stoneR * 0.22);
+    ctx.stroke();
+  }
+}
+/* ───────────────────────── HUD ───────────────────────── */
+/** 小棋子图标（HUD 里表示当前执子）。黑子加亮描边，否则在深色底上看不见。 */
+function drawMiniStone(ctx, cx, cy, r, color, theme) {
+  const g = ctx.createRadialGradient(cx - r * 0.3, cy - r * 0.3, r * 0.1, cx, cy, r);
+  if (color === BLACK) {
+    g.addColorStop(0, theme.stoneBlackHi); g.addColorStop(1, theme.stoneBlackLo);
+  } else {
+    g.addColorStop(0, theme.stoneWhiteHi); g.addColorStop(0.6, theme.stoneWhiteMid); g.addColorStop(1, theme.stoneWhiteLo);
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 33 / 49 页
+------------------------------------------------------------------------------------------------
+  }
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fillStyle = g; ctx.fill();
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.strokeStyle = color === BLACK ? 'rgba(255,255,255,0.6)' : 'rgba(0,0,0,0.4)';
+  ctx.lineWidth = Math.max(1, r * 0.24);
+  ctx.stroke();
+}
+/** 悬停/按下时的半透明预告棋子（浏览器有鼠标，小游戏无此交互）。 */
+export function drawHoverGhost(ctx, layout, state, theme) {
+  const hv = state.hover;
+  if (!hv || state.board.winner !== EMPTY) return;
+  if (!hv.valid) return;
+  const p = layout.board.toScreen(hv.x, hv.y);
+  const r = layout.board.stoneR;
+  ctx.save();
+  ctx.globalAlpha = 0.42;
+  drawStone(ctx, p.x, p.y, r * 0.94, state.board.current, theme);
+  ctx.restore();
+  // 十字准心，指明落点
+  ctx.save();
+  ctx.strokeStyle = theme.accent;
+  ctx.globalAlpha = 0.5;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, r * 1.3, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+}
+export function drawHud(ctx, layout, state, theme, now) {
+  const hud = layout.hud;
+  const cx = layout.width / 2;
+  // 标题
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = theme.textPrimary;
+  ctx.font = `700 ${theme.fontTitle}px ${FONT}`;
+  ctx.fillText('五子棋', cx, hud.y + hud.h * 0.30);
+  // 副标题：当前状态
+  const board = state.board;
+  let sub = '';
+  if (board.winner === BLACK || board.winner === WHITE) {
+    sub = `${board.winner === BLACK ? '黑棋' : '白棋'}获胜`;
+  } else if (board.winner === -1) {
+    sub = '和棋';
+  } else if (state.aiThinking) {
+    sub = 'AI 思考中';
+  } else if (state.mode === 'pve') {
+    sub = board.current === state.humanColor ? '轮到你落子' : 'AI 回合';
+  } else {
+    sub = board.current === BLACK ? '黑棋回合' : '白棋回合';
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 34 / 49 页
+------------------------------------------------------------------------------------------------
+  }
+  ctx.font = `500 ${theme.fontHud}px ${FONT}`;
+  ctx.fillStyle = state.aiThinking ? theme.accent : theme.textMuted;
+  // 执子小图标 + 文案（整体居中）
+  const showStone = !state.aiThinking && board.winner === EMPTY;
+  const textW = ctx.measureText(sub).width;
+  const iconR = theme.fontHud * 0.42;
+  const gap = showStone ? iconR * 2.4 : 0;
+  const totalW = textW + gap;
+  const startX = cx - totalW / 2;
+  if (showStone) {
+    drawMiniStone(ctx, startX + iconR, hud.y + hud.h * 0.60, iconR, board.current, theme);
+  }
+  ctx.textAlign = 'left';
+  ctx.fillText(sub, startX + gap, hud.y + hud.h * 0.60);
+  // AI 思考的三个跳动点
+  if (state.aiThinking) {
+    const baseX = startX + textW + 12;
+    for (let i = 0; i < 3; i++) {
+      const phase = ((now ?? 0) / 260 + i * 0.6) % (Math.PI * 2);
+      const dy = Math.sin(phase) * 3;
+      ctx.beginPath();
+      ctx.arc(baseX + i * 8, hud.y + hud.h * 0.60 + dy, 2.4, 0, Math.PI * 2);
+      ctx.fillStyle = theme.accent;
+      ctx.fill();
+    }
+  }
+  // 步数（右上角）
+  ctx.textAlign = 'right';
+  ctx.font = `500 ${theme.fontSmall}px ${FONT}`;
+  ctx.fillStyle = theme.textMuted;
+  ctx.fillText(`${board.moves.length} 手`, layout.width - hud.x, hud.y + hud.h * 0.30);
+  // 战绩（右下角，PVE 时显示）
+  if (state.mode === 'pve' && state.score) {
+    ctx.fillText(`你 ${state.score.win} : ${state.score.lose} AI`, layout.width - hud.x, hud.y + hud.h * 0.62);
+  }
+  ctx.textAlign = 'left';
+  // 规则 · 难度（居中第三行，弱化显示）
+  const ruleName = RULE_LABELS[state.mode]?.name ?? '';
+  const levelName = LEVELS[state.level]?.name ?? '';
+  if (ruleName || levelName) {
+    ctx.textAlign = 'center';
+    ctx.font = `500 ${theme.fontSmall}px ${FONT}`;
+    ctx.fillStyle = 'rgba(242,243,247,0.40)';
+    ctx.fillText(`${ruleName} · ${levelName}`, layout.width / 2, hud.y + hud.h * 0.88);
+    ctx.textAlign = 'left';
+  }
+}
+/** 左上角返回主界面按钮。 */
+export function drawBackButton(ctx, layout, state, theme) {
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 35 / 49 页
+------------------------------------------------------------------------------------------------
+  const b = layout.back;
+  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, b.w / 2, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.08)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  // 左箭头
+  ctx.beginPath();
+  ctx.moveTo(cx + b.w * 0.10, cy - b.w * 0.17);
+  ctx.lineTo(cx - b.w * 0.13, cy);
+  ctx.lineTo(cx + b.w * 0.10, cy + b.w * 0.17);
+  ctx.strokeStyle = theme.textPrimary;
+  ctx.lineWidth = Math.max(1.6, b.w * 0.075);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+  ctx.restore();
+}
+/** 右上角设置齿轮（对局界面为深色主题）。 */
+export function drawGearButton(ctx, layout, state, theme) {
+  const b = layout.gear;
+  if (!b) return;
+  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+  const R = b.w * 0.28;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, b.w / 2, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.08)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  ctx.translate(cx, cy);
+  ctx.fillStyle = 'rgba(242,243,247,0.92)';
+  for (let i = 0; i < 8; i++) {
+    ctx.save();
+    ctx.rotate((Math.PI / 4) * i);
+    ctx.fillRect(-R * 0.17, -R * 1.32, R * 0.34, R * 0.5);
+    ctx.restore();
+  }
+  ctx.beginPath();
+  ctx.arc(0, 0, R, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(0, 0, R * 0.40, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(20,24,34,0.95)';
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 36 / 49 页
+------------------------------------------------------------------------------------------------
+  ctx.fill();
+  ctx.restore();
+}
+/** 浮动提示（禁手 / 非法落子）。 */
+export function drawToast(ctx, layout, state, theme, now) {
+  const t = state.toast;
+  if (!t) return;
+  const age = (now ?? 0) - t.t0;
+  if (age > t.ms) { state.toast = null; return; }
+  const fade = age < 160 ? age / 160 : age > t.ms - 320 ? Math.max(0, (t.ms - age) / 320) : 1;
+  const text = t.text;
+  ctx.save();
+  ctx.globalAlpha = fade;
+  ctx.font = `600 ${theme.fontHud}px ${FONT}`;
+  const tw = ctx.measureText(text).width;
+  const padX = 18, h = 38;
+  const w = Math.min(layout.width - layout.pad * 3, tw + padX * 2);
+  const x = (layout.width - w) / 2;
+  const y = layout.buttons[0].y - h - 12;
+  pathRoundRect(ctx, x, y, w, h, h / 2);
+  ctx.fillStyle = 'rgba(20,14,8,0.88)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(240,180,41,0.55)';
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = theme.accent;
+  ctx.fillText(text, layout.width / 2, y + h / 2 + 0.5);
+  ctx.textAlign = 'left';
+  ctx.restore();
+}
+/* ───────────────────────── 按钮 ───────────────────────── */
+/**
+ * 底部按钮。labels 与 layout.buttons 一一对应。
+ */
+export function drawButtons(ctx, layout, state, theme, labels, disabled = []) {
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  layout.buttons.forEach((btn, i) => {
+    const pressed = state.pressIndex === i;
+    const isDisabled = disabled[i] === true;
+    const primary = i === 0;
+    pathRoundRect(ctx, btn.x, btn.y, btn.w, btn.h, btn.h / 2);
+    ctx.fillStyle = pressed ? theme.btnBgPressed : (primary ? theme.btnPrimaryBg : theme.btnBg);
+    ctx.fill();
+    ctx.strokeStyle = primary ? theme.btnPrimaryBorder : theme.btnBorder;
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    ctx.font = `600 ${theme.fontBtn}px ${FONT}`;
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 37 / 49 页
+------------------------------------------------------------------------------------------------
+    ctx.fillStyle = isDisabled
+      ? 'rgba(242,243,247,0.28)'
+      : (primary ? theme.accent : theme.textPrimary);
+    ctx.fillText(labels[i], btn.x + btn.w / 2, btn.y + btn.h / 2 + 0.5);
+  });
+}
+/* ───────────────────────── 结算浮层 ───────────────────────── */
+export function drawOverlay(ctx, layout, state, theme, now) {
+  const board = state.board;
+  const over = board.winner !== EMPTY;
+  if (!over) return;
+  const fade = clamp01(((now ?? 0) - (state.anim?.overT0 ?? now)) / 260);
+  ctx.save();
+  ctx.globalAlpha = fade * 0.5;   // 遮罩减淡，让胜负连线仍然看得见
+  ctx.fillStyle = '#05070c';
+  ctx.fillRect(0, 0, layout.width, layout.height);
+  ctx.restore();
+  const b = layout.board;
+  const cx = layout.width / 2;
+  // 卡片放在棋盘偏下位置，避免盖住中上部的棋形与连线
+  const cy = b.y + b.size * 0.70;
+  const cardW = Math.min(b.size * 0.84, layout.width - layout.pad * 4);
+  const cardH = Math.round(cardW * 0.40);
+  ctx.save();
+  ctx.globalAlpha = fade;
+  // 卡片
+  pathRoundRect(ctx, cx - cardW / 2, cy - cardH / 2, cardW, cardH, Math.round(cardH * 0.16));
+  ctx.fillStyle = 'rgba(28,32,44,0.96)';
+  ctx.fill();
+  ctx.strokeStyle = theme.panelBorder;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  // 结果大标题
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const winner = board.winner;
+  let title = '和棋';
+  let color = theme.textPrimary;
+  if (winner === BLACK || winner === WHITE) {
+    if (state.mode === 'pve') {
+      const humanWon = winner === state.humanColor;
+      title = humanWon ? '你赢了' : 'AI 获胜';
+      color = humanWon ? theme.success : theme.danger;
+    } else {
+      title = winner === BLACK ? '黑棋获胜' : '白棋获胜';
+      color = theme.accent;
+    }
+  }
+  ctx.font = `800 ${theme.fontBig}px ${FONT}`;
+  ctx.fillStyle = color;
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 38 / 49 页
+------------------------------------------------------------------------------------------------
+  ctx.fillText(title, cx, cy - cardH * 0.22);
+  // 补充信息
+  ctx.font = `500 ${theme.fontHud}px ${FONT}`;
+  ctx.fillStyle = theme.textMuted;
+  ctx.fillText(`共 ${board.moves.length} 手`, cx, cy + cardH * 0.02);
+  // 提示：点按钮继续
+  const pulse = 0.6 + 0.4 * Math.sin((now ?? 0) / 420);
+  ctx.globalAlpha = fade * pulse;
+  ctx.font = `500 ${theme.fontSmall}px ${FONT}`;
+  ctx.fillStyle = theme.accent;
+  ctx.fillText('点下方按钮开新局', cx, cy + cardH * 0.26);
+  ctx.restore();
+  ctx.textAlign = 'left';
+}
+/* ───────────────────────── 统一渲染入口 ───────────────────────── */
+/**
+ * 一次完整绘制。
+ * @param ctx Canvas 2D 上下文
+ * @param layout computeLayout 的结果
+ * @param state 游戏状态（见 app.js）
+ * @param theme THEME
+ * @param now 当前时间（ms，用于动画）
+ */
+export function renderFrame(ctx, layout, state, theme, now) {
+  ctx.clearRect(0, 0, layout.width, layout.height);
+  drawBackground(ctx, layout, theme);
+  drawBoard(ctx, layout, theme);
+  drawHoverGhost(ctx, layout, state, theme);
+  drawStones(ctx, layout, state, theme, now);
+  drawLastMarker(ctx, layout, state, theme, now);
+  drawWin(ctx, layout, state, theme, now);
+  drawHud(ctx, layout, state, theme, now);
+  drawBackButton(ctx, layout, state, theme);
+  drawGearButton(ctx, layout, state, theme);
+  drawButtons(
+    ctx, layout, state, theme,
+    state.buttonLabels ?? ['重新开始', '悔棋', '认输'],
+    [false, state.board.moves.length === 0 || state.aiThinking, false],
+  );
+  drawOverlay(ctx, layout, state, theme, now);
+  drawToast(ctx, layout, state, theme, now);
+}
+// ===== FILE: src/ui/screens.js =====
+/**
+ * 各场景渲染：大厅（游戏列表）/ 模式选择 / 难度选择 / 设置面板
+ * 全部为纯绘制函数（接收 ctx + layout + state + 主题），不持有状态。
+ *
+ * 视觉基调：青白渐变底 + 木质感卡片，与棋盘同一套木色，保持整体统一。
+ */
+import { pathRoundRect } from './renderer.js';
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 39 / 49 页
+------------------------------------------------------------------------------------------------
+import { RULE_LABELS, RULE_CASUAL, RULE_PRO } from '../core/rules.js';
+import { LEVELS } from '../core/ai.js';
+const FONT = '-apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif';
+/** 游戏清单：已实现的 + 规划中的（规划中显示为"敬请期待"）。 */
+export const GAMES = [
+  { id: 'gomoku', name: '五子棋', desc: '经典对弈 · 五种难度', glyph: '五', ready: true, color: '#c9a25e' },
+  { id: 'go', name: '围棋', desc: '规划中', glyph: '围', ready: false, color: '#8a9aa8' },
+  { id: 'xiangqi', name: '中国象棋', desc: '规划中', glyph: '象', ready: false, color: '#a8836a' },
+  { id: 'chess', name: '国际象棋', desc: '规划中', glyph: '国', ready: false, color: '#7f8fa6' },
+];
+export const MODE_ORDER = [RULE_CASUAL, RULE_PRO];
+export const LEVEL_ORDER = [1, 2, 3, 4, 5];
+/** 五档难度的一句话说明（供难度页展示）。 */
+export const LEVEL_DESC = {
+  1: '只看进攻，容易漏防',
+  2: '攻防兼顾，会堵冲四',
+  3: '带一步预判，会设陷阱',
+  4: '主动制造双威胁',
+  5: '近乎不失误',
+};
+/* ─────────────────── 背景与基础件 ─────────────────── */
+function drawPaperBackground(ctx, layout, M) {
+  const g = ctx.createLinearGradient(0, 0, 0, layout.height);
+  g.addColorStop(0, M.bgTop);
+  g.addColorStop(0.45, M.bgMid);
+  g.addColorStop(1, M.bgBottom);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, layout.width, layout.height);
+  const glow = ctx.createRadialGradient(
+    layout.width * 0.5, layout.safe.top + layout.height * 0.06, 10,
+    layout.width * 0.5, layout.safe.top + layout.height * 0.06, layout.width * 0.95,
+  );
+  glow.addColorStop(0, 'rgba(255,255,255,0.85)');
+  glow.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, layout.width, layout.height * 0.5);
+}
+function woodFill(ctx, x, y, w, h, r, M, strong) {
+  const g = ctx.createLinearGradient(0, y, 0, y + h);
+  g.addColorStop(0, strong ? M.selectedTop : M.woodTop);
+  g.addColorStop(1, strong ? M.selectedBottom : M.woodBottom);
+  pathRoundRect(ctx, x, y, w, h, r);
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.save();
+  pathRoundRect(ctx, x, y, w, h, r);
+  ctx.clip();
+  const hi = ctx.createLinearGradient(0, y, 0, y + h * 0.5);
+  hi.addColorStop(0, 'rgba(255,255,255,0.5)');
+  hi.addColorStop(1, 'rgba(255,255,255,0)');
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 40 / 49 页
+------------------------------------------------------------------------------------------------
+  ctx.fillStyle = hi;
+  ctx.fillRect(x, y, w, h * 0.5);
+  ctx.restore();
+}
+function cardFill(ctx, x, y, w, h, r, M, opts = {}) {
+  const { pressed = false, dim = false } = opts;
+  ctx.save();
+  ctx.shadowColor = M.cardShadow;
+  ctx.shadowBlur = pressed ? 4 : 10;
+  ctx.shadowOffsetY = pressed ? 1 : 3;
+  pathRoundRect(ctx, x, y, w, h, r);
+  ctx.fillStyle = dim ? 'rgba(255,255,255,0.5)' : M.cardBg;
+  ctx.fill();
+  ctx.restore();
+  pathRoundRect(ctx, x + 0.5, y + 0.5, w - 1, h - 1, r);
+  ctx.strokeStyle = M.cardBorder;
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+}
+/** 左上角返回箭头。 */
+function drawBackIcon(ctx, rect, M, pressed) {
+  const cx = rect.x + rect.w / 2, cy = rect.y + rect.h / 2;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, rect.w / 2, 0, Math.PI * 2);
+  ctx.fillStyle = pressed ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.62)';
+  ctx.fill();
+  ctx.strokeStyle = M.cardBorder;
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  const s = rect.w;
+  ctx.beginPath();
+  ctx.moveTo(cx + s * 0.11, cy - s * 0.16);
+  ctx.lineTo(cx - s * 0.12, cy);
+  ctx.lineTo(cx + s * 0.11, cy + s * 0.16);
+  ctx.strokeStyle = M.woodDeep;
+  ctx.lineWidth = Math.max(1.6, s * 0.08);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+  ctx.restore();
+}
+/** 右上角设置齿轮。 */
+function drawGearIcon(ctx, rect, M, pressed) {
+  const cx = rect.x + rect.w / 2, cy = rect.y + rect.h / 2;
+  const R = rect.w * 0.30;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, rect.w / 2, 0, Math.PI * 2);
+  ctx.fillStyle = pressed ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.62)';
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 41 / 49 页
+------------------------------------------------------------------------------------------------
+  ctx.fill();
+  ctx.strokeStyle = M.cardBorder;
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  // 齿（8 个矩形）
+  ctx.translate(cx, cy);
+  ctx.fillStyle = M.woodDeep;
+  for (let i = 0; i < 8; i++) {
+    ctx.save();
+    ctx.rotate((Math.PI / 4) * i);
+    ctx.fillRect(-R * 0.16, -R * 1.34, R * 0.32, R * 0.5);
+    ctx.restore();
+  }
+  // 盘 + 中心孔
+  ctx.beginPath();
+  ctx.arc(0, 0, R, 0, Math.PI * 2);
+  ctx.fillStyle = M.woodDeep;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(0, 0, R * 0.42, 0, Math.PI * 2);
+  ctx.fillStyle = pressed ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.8)';
+  ctx.fill();
+  ctx.restore();
+}
+/** 标题 + 副标题（各界面共用）。 */
+function drawTitle(ctx, t, M, main, sub) {
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const cy = t.y + t.h * 0.44;
+  ctx.font = `800 ${M.fontTitle}px ${FONT}`;
+  ctx.fillStyle = M.textTitle;
+  ctx.fillText(main, t.x + t.w / 2, cy);
+  const lineW = Math.min(120, t.w * 0.3);
+  ctx.beginPath();
+  ctx.moveTo(t.x + t.w / 2 - lineW / 2, cy + M.fontTitle * 0.82);
+  ctx.lineTo(t.x + t.w / 2 + lineW / 2, cy + M.fontTitle * 0.82);
+  ctx.strokeStyle = M.accentLine;
+  ctx.lineWidth = 2;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+  if (sub) {
+    ctx.font = `500 ${M.fontSub}px ${FONT}`;
+    ctx.fillStyle = M.textMuted;
+    ctx.fillText(sub, t.x + t.w / 2, cy + M.fontTitle * 1.36);
+  }
+  ctx.textAlign = 'left';
+}
+/* ─────────────────── ① 大厅：游戏列表 ─────────────────── */
+export function renderHall(ctx, layout, state, M) {
+  drawPaperBackground(ctx, layout, M);
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 42 / 49 页
+------------------------------------------------------------------------------------------------
+  drawTitle(ctx, layout.title, M, '纯净玩', '棋类小游戏合集 · 无广告 · 随手一局');
+  // 游戏卡片
+  GAMES.forEach((game, i) => {
+    const c = layout.cards[i];
+    if (!c) return;
+    const pressed = state.press?.kind === 'game' && state.press.index === i;
+    const r = Math.round(Math.min(c.w, c.h) * 0.14);
+    cardFill(ctx, c.x, c.y, c.w, c.h, r, M, { pressed, dim: !game.ready });
+    // 图标圆
+    const iconR = Math.round(Math.min(c.w, c.h) * 0.22);
+    const icx = c.x + c.w / 2, icy = c.y + c.h * 0.36;
+    const g = ctx.createLinearGradient(0, icy - iconR, 0, icy + iconR);
+    g.addColorStop(0, game.ready ? M.woodTop : '#dfe6e6');
+    g.addColorStop(1, game.ready ? M.woodBottom : '#c8d2d2');
+    ctx.beginPath();
+    ctx.arc(icx, icy, iconR, 0, Math.PI * 2);
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.strokeStyle = M.cardBorder;
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = `700 ${Math.round(iconR * 1.05)}px ${FONT}`;
+    ctx.fillStyle = game.ready ? M.textOnWood : 'rgba(61,91,86,0.45)';
+    ctx.fillText(game.glyph, icx, icy + 1);
+    // 名称与说明
+    ctx.font = `700 ${M.fontCard}px ${FONT}`;
+    ctx.fillStyle = game.ready ? M.textBody : 'rgba(61,91,86,0.45)';
+    ctx.fillText(game.name, c.x + c.w / 2, c.y + c.h * 0.68);
+    ctx.font = `500 ${M.fontCardSub}px ${FONT}`;
+    ctx.fillStyle = M.textMuted;
+    ctx.fillText(game.desc, c.x + c.w / 2, c.y + c.h * 0.84);
+    ctx.textAlign = 'left';
+  });
+  // 齿轮 + 底部说明
+  drawGearIcon(ctx, layout.gear, M, state.press?.kind === 'gear');
+  ctx.textAlign = 'center';
+  ctx.font = `500 ${M.fontCardSub}px ${FONT}`;
+  ctx.fillStyle = M.textMuted;
+  ctx.fillText('更多棋类陆续加入', layout.hint.x + layout.hint.w / 2, layout.hint.y + layout.hint.h / 2);
+  ctx.textAlign = 'left';
+}
+/* ─────────────────── ② 模式：上下两大块 ─────────────────── */
+export function renderMode(ctx, layout, state, M) {
+  drawPaperBackground(ctx, layout, M);
+  drawTitle(ctx, layout.title, M, '选择模式', '五子棋');
+  MODE_ORDER.forEach((key, i) => {
+    const b = layout.blocks[i];
+    if (!b) return;
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 43 / 49 页
+------------------------------------------------------------------------------------------------
+    const pressed = state.press?.kind === 'mode' && state.press.index === i;
+    const r = Math.round(Math.min(b.w, b.h) * 0.14);
+    woodFill(ctx, b.x, b.y, b.w, b.h, r, M, true);
+    if (pressed) {
+      pathRoundRect(ctx, b.x, b.y, b.w, b.h, r);
+      ctx.fillStyle = 'rgba(0,0,0,0.06)';
+      ctx.fill();
+    }
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    // 字号按「宽度」推导并夹紧（早先按块高算，在长屏上会大到 70px 并溢出）
+    const nameSize = Math.max(20, Math.min(30, Math.round(b.w * 0.085)));
+    const descSize = Math.max(11, Math.min(14, Math.round(b.w * 0.036)));
+    // 名称
+    ctx.font = `800 ${nameSize}px ${FONT}`;
+    ctx.fillStyle = M.selectedText;
+    ctx.fillText(RULE_LABELS[key].name, b.x + b.w * 0.08, b.y + b.h * 0.40);
+    // 说明（文案已缩短，确保不越过箭头区）
+    ctx.font = `500 ${descSize}px ${FONT}`;
+    ctx.fillStyle = 'rgba(66,41,6,0.86)';
+    const brief = key === RULE_CASUAL
+      ? '无禁手 · 先成五者胜'
+      : '黑棋三三 / 四四 / 长连禁手';
+    ctx.fillText(brief, b.x + b.w * 0.08, b.y + b.h * 0.70);
+    // 右侧箭头
+    const ax = b.x + b.w - b.w * 0.07, ay = b.y + b.h / 2;
+    ctx.beginPath();
+    ctx.moveTo(ax - 9, ay - 11);
+    ctx.lineTo(ax + 4, ay);
+    ctx.lineTo(ax - 9, ay + 11);
+    ctx.strokeStyle = 'rgba(74,47,8,0.85)';
+    ctx.lineWidth = 2.6;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+  });
+  drawBackIcon(ctx, layout.back, M, state.press?.kind === 'back');
+  drawGearIcon(ctx, layout.gear, M, state.press?.kind === 'gear');
+}
+/* ─────────────────── ③ 难度：竖排列表 ─────────────────── */
+export function renderLevel(ctx, layout, state, M) {
+  drawPaperBackground(ctx, layout, M);
+  const modeName = RULE_LABELS[state.mode]?.name ?? '';
+  drawTitle(ctx, layout.title, M, '选择难度', modeName);
+  LEVEL_ORDER.forEach((lv, i) => {
+    const r0 = layout.rows[i];
+    if (!r0) return;
+    const pressed = state.press?.kind === 'level' && state.press.index === i;
+    const r = Math.round(r0.h / 2);
+    cardFill(ctx, r0.x, r0.y, r0.w, r0.h, r, M, { pressed });
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 44 / 49 页
+------------------------------------------------------------------------------------------------
+    // 难度名
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.font = `700 ${M.fontLevel}px ${FONT}`;
+    ctx.fillStyle = M.textBody;
+    ctx.fillText(LEVELS[lv].name, r0.x + r0.w * 0.06, r0.y + r0.h / 2);
+    // 说明
+    ctx.font = `500 ${M.fontCardSub}px ${FONT}`;
+    ctx.fillStyle = M.textMuted;
+    ctx.fillText(LEVEL_DESC[lv] ?? '', r0.x + r0.w * 0.28, r0.y + r0.h / 2);
+    // 右侧强度条（实心数 = 难度）
+    const barW = Math.max(3, Math.round(r0.w * 0.018));
+    const gap = Math.max(2, Math.round(barW * 0.8));
+    const totalW = 5 * barW + 4 * gap;
+    const bx = r0.x + r0.w - r0.w * 0.06 - totalW;
+    for (let k = 0; k < 5; k++) {
+      const full = k < lv;
+      const bh = r0.h * (0.34 + k * 0.08);
+      pathRoundRect(
+        ctx,
+        bx + k * (barW + gap), r0.y + r0.h / 2 - bh / 2,
+        barW, bh, barW / 2,
+      );
+      ctx.fillStyle = full ? M.selectedBottom : 'rgba(120,110,90,0.20)';
+      ctx.fill();
+    }
+  });
+  drawBackIcon(ctx, layout.back, M, state.press?.kind === 'back');
+  drawGearIcon(ctx, layout.gear, M, state.press?.kind === 'gear');
+}
+/* ─────────────────── ④ 设置面板 ─────────────────── */
+/**
+ * @param state.settings { music: 0..1, open: bool }
+ */
+export function renderSettings(ctx, layout, state, M, now) {
+  const s = state.settings ?? { music: 0.5 };
+  const L = state.settingsLayout;
+  if (!L) return;
+  // 遮罩
+  ctx.save();
+  ctx.fillStyle = 'rgba(18,28,26,0.45)';
+  ctx.fillRect(0, 0, layout.width, layout.height);
+  ctx.restore();
+  const p = L.panel;
+  const r = Math.round(p.w * 0.08);
+  ctx.save();
+  ctx.shadowColor = 'rgba(60,50,20,0.28)';
+  ctx.shadowBlur = 26;
+  ctx.shadowOffsetY = 8;
+  pathRoundRect(ctx, p.x, p.y, p.w, p.h, r);
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 45 / 49 页
+------------------------------------------------------------------------------------------------
+  ctx.fillStyle = '#f6faf9';
+  ctx.fill();
+  ctx.restore();
+  pathRoundRect(ctx, p.x + 0.5, p.y + 0.5, p.w - 1, p.h - 1, r);
+  ctx.strokeStyle = M.cardBorder;
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+  // 标题
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `800 ${Math.round(p.w * 0.075)}px ${FONT}`;
+  ctx.fillStyle = M.textTitle;
+  ctx.fillText('设置', p.x + p.w / 2, L.titleY);
+  // 标签
+  ctx.font = `600 ${M.fontLevel}px ${FONT}`;
+  ctx.fillStyle = M.textBody;
+  ctx.textAlign = 'left';
+  ctx.fillText('背景音乐', L.slider.x, L.labelY);
+  // 数值
+  ctx.textAlign = 'right';
+  ctx.fillStyle = M.textMuted;
+  const pct = Math.round(s.music * 100);
+  ctx.fillText(pct === 0 ? '静音' : `${pct}%`, L.slider.x + L.slider.w, L.labelY);
+  ctx.textAlign = 'left';
+  // 滑轨
+  const sl = L.slider;
+  pathRoundRect(ctx, sl.x, sl.y, sl.w, sl.h, sl.h / 2);
+  ctx.fillStyle = 'rgba(120,140,135,0.25)';
+  ctx.fill();
+  // 已选部分
+  const filled = Math.max(0, Math.min(1, s.music)) * sl.w;
+  if (filled > 0) {
+    pathRoundRect(ctx, sl.x, sl.y, Math.max(sl.h, filled), sl.h, sl.h / 2);
+    const g = ctx.createLinearGradient(sl.x, 0, sl.x + sl.w, 0);
+    g.addColorStop(0, M.woodTop);
+    g.addColorStop(1, M.woodBottom);
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(140,100,40,0.5)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  // 滑块
+  const kx = sl.x + filled;
+  const ky = sl.y + sl.h / 2;
+  ctx.beginPath();
+  ctx.arc(kx, ky, sl.knobR, 0, Math.PI * 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+  ctx.strokeStyle = M.woodEdge;
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 46 / 49 页
+------------------------------------------------------------------------------------------------
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(kx, ky, sl.knobR * 0.38, 0, Math.PI * 2);
+  ctx.fillStyle = M.selectedBottom;
+  ctx.fill();
+  // 说明
+  ctx.textAlign = 'center';
+  ctx.font = `500 ${M.fontCardSub}px ${FONT}`;
+  ctx.fillStyle = M.textMuted;
+  ctx.fillText('古筝 · 悠扬平静', p.x + p.w / 2, L.valueY);
+  ctx.fillText('拖动滑块调节，0 为静音', p.x + p.w / 2, L.hintY);
+  // 关闭按钮
+  const c = L.close;
+  ctx.beginPath();
+  ctx.arc(c.x + c.w / 2, c.y + c.h / 2, c.w / 2, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(120,140,135,0.18)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(74,47,8,0.55)';
+  ctx.lineWidth = 2;
+  ctx.lineCap = 'round';
+  const cx = c.x + c.w / 2, cy = c.y + c.h / 2, d = c.w * 0.22;
+  ctx.beginPath();
+  ctx.moveTo(cx - d, cy - d); ctx.lineTo(cx + d, cy + d);
+  ctx.moveTo(cx + d, cy - d); ctx.lineTo(cx - d, cy + d);
+  ctx.stroke();
+  ctx.textAlign = 'left';
+}
+// ===== FILE: src/audio/bgm.js =====
+/**
+ * 背景音乐：程序化合成的「古筝风格」旋律（零音频资源，不占小游戏包体）
+ *
+ * 为什么不用音频文件：
+ *   小游戏主包只有 4MB，一段可循环的古筝曲通常 1–3MB；而古筝音色特征明确
+ *   （拨弦 + 快速起音 + 指数衰减 + 丰富泛音），完全可以用几个振荡器合成。
+ *   这样包体零增长，音量/速度也能实时调。
+ *
+ * 音色设计：
+ *   基频（三角波）+ 八度与十二度泛音（正弦）+ 拨弦包络 + 低通滤波
+ *   → 接近古筝/竖琴的"拨弦"听感。
+ *
+ * 旋律设计：
+ *   五声音阶（宫商角徵羽，D 调），慢速（约 62 BPM），音符多为长音与级进，
+ *   符合"悠扬、平静"的要求；循环播放，循环点在乐句收尾处。
+ *
+ * 平台适配：小游戏用 wx.createWebAudioContext()，浏览器用 AudioContext。
+ * 若环境不支持音频，则静默降级（不影响游戏本身）。
+ */
+/** 取当前平台的音频上下文（拿不到就返回 null，调用方静默降级）。 */
+export function createAudioContext() {
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 47 / 49 页
+------------------------------------------------------------------------------------------------
+  try {
+    if (typeof wx !== 'undefined' && typeof wx.createWebAudioContext === 'function') {
+      return wx.createWebAudioContext();
+    }
+    const Ctor = typeof AudioContext !== 'undefined'
+      ? AudioContext
+      : (typeof webkitAudioContext !== 'undefined' ? webkitAudioContext : null);
+    return Ctor ? new Ctor() : null;
+  } catch {
+    return null;
+  }
+}
+/** 五声音阶（D 宫调）的频率表：D E G A B + 高八度。 */
+const F = {
+  D4: 293.66, E4: 329.63, G4: 392.00, A4: 440.00, B4: 493.88,
+  D5: 587.33, E5: 659.25, G5: 783.99, A5: 880.00, B5: 987.77,
+};
+/**
+ * 旋律：{ n: 音名, d: 时值(拍) }，null 表示休止。
+ * 2 拍 ≈ 长音，1 拍 ≈ 走音；整体级进为主，句尾落回主音，听感平静。
+ */
+const MELODY = [
+  { n: 'D4', d: 2 }, { n: 'A4', d: 1 }, { n: 'G4', d: 1 },
+  { n: 'E4', d: 2 }, { n: 'G4', d: 1 }, { n: 'A4', d: 1 },
+  { n: 'D5', d: 2 }, { n: 'B4', d: 1 }, { n: 'A4', d: 1 },
+  { n: 'G4', d: 3 }, { n: null, d: 1 },
+  { n: 'E4', d: 2 }, { n: 'G4', d: 1 }, { n: 'A4', d: 1 },
+  { n: 'B4', d: 2 }, { n: 'A4', d: 1 }, { n: 'G4', d: 1 },
+  { n: 'E5', d: 2 }, { n: 'D5', d: 1 }, { n: 'B4', d: 1 },
+  { n: 'A4', d: 3 }, { n: null, d: 1 },
+];
+const BPM = 62;
+/**
+ * 创建背景音乐播放器。
+ * @returns {{start:Function, stop:Function, setVolume:Function, getVolume:Function, resume:Function, supported:boolean, isPlaying:Function}}
+ */
+export function createBgm(options = {}) {
+  const ctx = options.context ?? createAudioContext();
+  const supported = !!ctx;
+  let master = null;
+  let playing = false;
+  let timer = null;
+  let volume = options.volume ?? 0.5;
+  if (supported) {
+    master = ctx.createGain();
+    master.gain.value = volume * 0.5; // 背景音乐再压一半，避免压过操作音
+    master.connect(ctx.destination);
+  }
+  /** 合成一个拨弦音（古筝感）。 */
+  function pluck(freq, at, durSec, level = 0.5) {
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 48 / 49 页
+------------------------------------------------------------------------------------------------
+    const osc1 = ctx.createOscillator();
+    const osc2 = ctx.createOscillator();
+    const osc3 = ctx.createOscillator();
+    osc1.type = 'triangle'; osc1.frequency.value = freq;
+    osc2.type = 'sine'; osc2.frequency.value = freq * 2;
+    osc3.type = 'sine'; osc3.frequency.value = freq * 3;
+    const g2 = ctx.createGain(); g2.gain.value = 0.32;
+    const g3 = ctx.createGain(); g3.gain.value = 0.14;
+    const env = ctx.createGain();
+    // 拨弦包络：瞬间起音 → 快速衰减 → 尾音
+    env.gain.setValueAtTime(0.0001, at);
+    env.gain.linearRampToValueAtTime(level, at + 0.01);
+    env.gain.exponentialRampToValueAtTime(level * 0.28, at + Math.min(0.35, durSec * 0.35));
+    env.gain.exponentialRampToValueAtTime(0.0001, at + durSec);
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(2600, at);
+    filter.frequency.exponentialRampToValueAtTime(900, at + durSec);
+    osc1.connect(env);
+    osc2.connect(g2); g2.connect(env);
+    osc3.connect(g3); g3.connect(env);
+    env.connect(filter);
+    filter.connect(master);
+    for (const osc of [osc1, osc2, osc3]) {
+      osc.start(at);
+      osc.stop(at + durSec + 0.05);
+    }
+  }
+  /** 调度一整轮旋律。 */
+  function scheduleLoop() {
+    if (!playing || !supported) return;
+    const beat = 60 / BPM;
+    let at = ctx.currentTime + 0.08;   // 略微提前，避免首音被裁
+    let total = 0;
+    for (const note of MELODY) {
+      const dur = note.d * beat;
+      if (note.n) {
+        // 长音让尾音更长，短音稍干
+        pluck(F[note.n], at, Math.max(0.9, dur * 1.15), note.d >= 2 ? 0.42 : 0.32);
+      }
+      at += dur;
+      total += dur;
+    }
+    // 下一轮在上轮结束前 0.3 秒再调度，保证不断
+    timer = setTimeout(scheduleLoop, Math.max(500, (total - 0.3) * 1000));
+  }
+  return {
+    supported,
+    isPlaying: () => playing,
+    start() {
+
+纯净玩棋类益智游戏合集软件 V1.0                                                                   第 49 / 49 页
+------------------------------------------------------------------------------------------------
+      if (!supported || playing) return false;
+      playing = true;
+      try { if (ctx.state === 'suspended') ctx.resume(); } catch { /* ignore */ }
+      scheduleLoop();
+      return true;
+    },
+    stop() {
+      playing = false;
+      if (timer) { clearTimeout(timer); timer = null; }
+    },
+    /** 设置音量 0..1（0 即静音，但仍继续调度，便于随时恢复）。 */
+    setVolume(v) {
+      volume = Math.max(0, Math.min(1, Number(v) || 0));
+      if (master) {
+        try { master.gain.value = volume * 0.5; } catch { /* ignore */ }
+      }
+      return volume;
+    },
+    getVolume: () => volume,
+    /** 部分平台要求用户交互后才能出声。 */
+    resume() {
+      if (!supported) return;
+      try { if (ctx.state === 'suspended') ctx.resume(); } catch { /* ignore */ }
+    },
+    dispose() {
+      this.stop();
+      if (master) { try { master.disconnect(); } catch { /* ignore */ } }
+    },
+  };
+}
+
+
